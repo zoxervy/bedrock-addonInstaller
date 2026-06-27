@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 PACK_EXTS = {".mcpack", ".mcaddon", ".mctemplate", ".zip"}
-TAR_EXTS  = {".tar.gz", ".tgz", ".tar.bz2"}      # format tar yang didukung
+TAR_EXTS  = {".tar.gz", ".tgz", ".tar.bz2"}      # supported tar formats
 WORLD_MARKERS = {"level.dat", "levelname.txt"}
 DRY_RUN = False
 MAX_ARCHIVE_MB = 500
@@ -23,17 +23,17 @@ UUID_RE = re.compile(
 
 
 def is_tar_file(path: Path) -> bool:
-    """Cek apakah path adalah file tar (mendukung ekstensi ganda .tar.gz)."""
+    """Check whether path is a tar file, including double extensions like .tar.gz."""
     name = path.name.lower()
     return any(name.endswith(ext) for ext in TAR_EXTS)
 
 
 def is_pack_file(path: Path) -> bool:
-    """Cek apakah path adalah file pack/archive yang didukung."""
+    """Check whether path is a supported pack/archive file."""
     return path.suffix.lower() in PACK_EXTS or is_tar_file(path)
 
 def is_within_dir(base: Path, target: Path) -> bool:
-    """Cek target tetap berada di dalam base setelah resolve."""
+    """Check that target stays inside base after resolving paths."""
     try:
         return os.path.commonpath([str(base.resolve()), str(target.resolve())]) == str(base.resolve())
     except ValueError:
@@ -41,7 +41,7 @@ def is_within_dir(base: Path, target: Path) -> bool:
 
 
 def safe_child_path(base: Path, name: str, label: str) -> Path:
-    """Buat path anak yang tidak boleh escape dari base."""
+    """Build a child path that cannot escape base."""
     target = base / name
     if not is_within_dir(base, target):
         raise RuntimeError(f"Path traversal blocked: {label}")
@@ -49,14 +49,14 @@ def safe_child_path(base: Path, name: str, label: str) -> Path:
 
 
 def safe_world_name(name: str) -> str:
-    """Validasi nama world agar tidak bisa menjadi path traversal."""
+    """Validate world names so they cannot become path traversal."""
     cleaned = name.strip()
     if not cleaned:
-        raise RuntimeError("Nama world tidak boleh kosong.")
+        raise RuntimeError("World name cannot be empty.")
     if Path(cleaned).is_absolute() or Path(cleaned).name != cleaned:
-        raise RuntimeError(f"Nama world tidak aman: {name}")
+        raise RuntimeError(f"Unsafe world name: {name}")
     if cleaned in {".", ".."}:
-        raise RuntimeError(f"Nama world tidak aman: {name}")
+        raise RuntimeError(f"Unsafe world name: {name}")
     return cleaned
 
 
@@ -65,7 +65,7 @@ log = logging.getLogger("bedrock_addon")
 
 
 def setup_logging():
-    """Inisialisasi logger ke file dan stdout sekaligus."""
+    """Initialize logging to file and stderr."""
     log.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
@@ -106,7 +106,7 @@ _COLOR_ENABLED = False
 
 
 def _enable_colors() -> bool:
-    """Aktifkan ANSI color. Di Windows, aktifkan VT mode via ctypes."""
+    """Enable ANSI color. On Windows, enable VT mode through ctypes."""
     global _COLOR_ENABLED
     if not sys.stdout.isatty():
         return False
@@ -122,12 +122,12 @@ def _enable_colors() -> bool:
         except Exception:
             return False
     _COLOR_ENABLED = True
-    log.info("Warna terminal: aktif")
+    log.info("Terminal color: enabled")
     return True
 
 
 def _c(code: str, text: str) -> str:
-    """Bungkus text dengan ANSI escape code jika warna aktif."""
+    """Wrap text with ANSI escape code when color is enabled."""
     return f"\033[{code}m{text}\033[0m" if _COLOR_ENABLED else text
 
 def c_green(t: str)  -> str: return _c("92", t)
@@ -147,7 +147,7 @@ def c_divider(t: str = "") -> str:
 
 # ── Progress bar ─────────────────────────────────────────────────────────────
 def print_progress(current: int, total: int, label: str = "", bar_width: int = 28) -> None:
-    """Tampilkan progress bar di baris yang sama (carriage-return overwrite)."""
+    """Show a progress bar on the same line using carriage-return overwrite."""
     if total == 0:
         return
     pct  = current / total
@@ -179,7 +179,7 @@ def yes_no(prompt, default=True):
             return True
         if value in ("n", "no", "tidak", "ga", "gak"):
             return False
-        print("Jawab y/n.")
+        print("Answer y/n.")
 
 
 def action(text: str) -> None:
@@ -231,18 +231,18 @@ def validate_server_dir(server_dir):
     if not (server_dir / binary_name).exists():
         missing.append(binary_name)
     if missing:
-        raise RuntimeError(f"Folder ini bukan/kurang server Bedrock. Missing: {', '.join(missing)}")
+        raise RuntimeError(f"This folder is not a valid/complete Bedrock server. Missing: {', '.join(missing)}")
 
 
 def choose_server_dir():
-    """Pilih folder server Bedrock lewat menu interaktif."""
+    """Choose a Bedrock server folder through an interactive menu."""
     current = Path.cwd().resolve()
     while True:
         print(f"\n{c_bold('Currently in :')} [{current}]")
-        print(f"  1) Pakai folder ini sebagai directory server ({current.name})")
-        print("  2) List semua folder yang ada di sini")
-        print("  3) Masukkan manual path")
-        choice = ask("Pilih opsi", "1")
+        print(f"  1) Use this folder as the server directory ({current.name})")
+        print("  2) List all folders here")
+        print("  3) Enter a manual path")
+        choice = ask("Choose an option", "1")
 
         try:
             if choice == "1":
@@ -250,30 +250,30 @@ def choose_server_dir():
             elif choice == "2":
                 folders = sorted([p for p in current.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
                 if not folders:
-                    print("Tidak ada folder di directory ini.")
+                    print("No folders in this directory.")
                     continue
-                print("\nFolder tersedia:")
+                print("\nAvailable folders:")
                 for idx, folder in enumerate(folders, 1):
                     print(f"  {idx}) {folder.name}")
-                raw = ask("Pilih nomor folder")
+                raw = ask("Choose folder number")
                 try:
                     index = int(raw)
                 except (TypeError, ValueError):
-                    print("Pilihan harus angka.")
+                    print("Choice must be a number.")
                     continue
                 if index < 1 or index > len(folders):
-                    print("Pilihan folder tidak valid.")
+                    print("Invalid folder choice.")
                     continue
                 server_dir = folders[index - 1]
             elif choice == "3":
-                manual = ask("Path folder server Bedrock", str(current))
+                manual = ask("Bedrock server folder path", str(current))
                 server_dir = Path(manual).expanduser().resolve()
             else:
-                print("Pilihan harus 1, 2, atau 3.")
+                print("Choice must be 1, 2, or 3.")
                 continue
 
             if not server_dir.exists():
-                print(f"Folder server tidak ada: {server_dir}")
+                print(f"Server folder does not exist: {server_dir}")
                 continue
             validate_server_dir(server_dir)
             return server_dir
@@ -282,53 +282,53 @@ def choose_server_dir():
 
 
 def validate_uuid(uuid, context=""):
-    """Validasi format UUID standar (8-4-4-4-12 hex)."""
+    """Validate standard UUID format (8-4-4-4-12 hex)."""
     label = f" di {context}" if context else ""
     if not uuid or not UUID_RE.match(uuid):
-        raise RuntimeError(f"UUID tidak valid{label}: {uuid!r}")
+        raise RuntimeError(f"Invalid UUID{label}: {uuid!r}")
 
 
 def validate_archive(archive: Path) -> None:
-    """Validasi ukuran dan integritas file archive (zip atau tar) sebelum diproses."""
+    """Validate archive size and integrity before processing."""
     if not archive.exists():
-        raise RuntimeError(f"File tidak ada: {archive}")
+        raise RuntimeError(f"File does not exist: {archive}")
     size_mb = archive.stat().st_size / (1024 * 1024)
     log.info("Archive: %s (%.1f MB)", archive.name, size_mb)
     if size_mb > MAX_ARCHIVE_MB:
         raise RuntimeError(
-            f"File terlalu besar: {size_mb:.1f} MB (batas {MAX_ARCHIVE_MB} MB). "
-            f"Ubah MAX_ARCHIVE_MB jika memang diperlukan."
+            f"File is too large: {size_mb:.1f} MB (limit {MAX_ARCHIVE_MB} MB). "
+            f"Change MAX_ARCHIVE_MB if needed."
         )
     if is_tar_file(archive):
         if not tarfile.is_tarfile(archive):
-            raise RuntimeError(f"Bukan tar valid: {archive}")
+            raise RuntimeError(f"Not a valid tar file: {archive}")
     elif not zipfile.is_zipfile(archive):
-        raise RuntimeError(f"Bukan zip/mcpack valid: {archive}")
+        raise RuntimeError(f"Not a valid zip/mcpack file: {archive}")
     log.info("Archive valid: %s (%.1f MB)", archive.name, size_mb)
 
 
 def check_disk_space(src, dest_parent):
-    """Pastikan disk tujuan punya ruang cukup untuk menyalin src."""
+    """Ensure the destination disk has enough free space to copy src."""
     if DRY_RUN:
         return
     needed = sum(f.stat().st_size for f in Path(src).rglob("*") if f.is_file())
     try:
         free = shutil.disk_usage(dest_parent).free
     except OSError:
-        log.warning("Tidak bisa cek disk space di %s, skip.", dest_parent)
+        log.warning("Cannot check disk space at %s, skipping.", dest_parent)
         return
     needed_mb = needed / (1024 * 1024)
     free_mb = free / (1024 * 1024)
-    log.info("Disk check: butuh %.1f MB, tersisa %.1f MB di %s", needed_mb, free_mb, dest_parent)
+    log.info("Disk check: need %.1f MB, available %.1f MB at %s", needed_mb, free_mb, dest_parent)
     if needed > free:
         raise RuntimeError(
-            f"Disk tidak cukup: butuh {needed_mb:.1f} MB, "
-            f"tersisa {free_mb:.1f} MB di {dest_parent}"
+            f"Not enough disk space: need {needed_mb:.1f} MB, "
+            f"available {free_mb:.1f} MB at {dest_parent}"
         )
 
 
 def safe_extract(zip_path: Path, dest: Path) -> None:
-    """Ekstrak ZIP dengan proteksi path traversal (zip slip)."""
+    """Extract ZIP with path traversal protection (zip slip)."""
     dest = dest.resolve()
     with zipfile.ZipFile(zip_path) as z:
         members = z.infolist()
@@ -352,7 +352,7 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
 
 
 def safe_extract_tar(tar_path: Path, dest: Path) -> None:
-    """Ekstrak TAR (.tar.gz/.tgz/.tar.bz2) dengan proteksi path traversal."""
+    """Extract TAR (.tar.gz/.tgz/.tar.bz2) with path traversal protection."""
     dest = dest.resolve()
     with tarfile.open(tar_path) as tf:
         members = tf.getmembers()
@@ -373,7 +373,7 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
                 continue
             src = tf.extractfile(member)
             if src is None:
-                raise RuntimeError(f"Tidak bisa ekstrak tar member: {member.name}")
+                raise RuntimeError(f"Cannot extract tar member: {member.name}")
             target.parent.mkdir(parents=True, exist_ok=True)
             with src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
@@ -385,20 +385,20 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
 
 
 def safe_copytree(src: Path, dest: Path) -> None:
-    """Salin direktori src ke dest dengan backup, disk check, dan progress bar."""
+    """Copy src directory to dest with backup, disk check, and progress bar."""
     if dest.exists():
-        if yes_no(f"Folder {dest.name} sudah ada. Replace?", True):
+        if yes_no(f"Folder {dest.name} already exists. Replace?", True):
             backup_existing(dest)
             log.info("Remove: %s", dest)
             if not DRY_RUN:
                 shutil.rmtree(dest)
         else:
-            raise RuntimeError("Dibatalkan karena folder pack/world sudah ada.")
+            raise RuntimeError("Cancelled because the pack/world folder already exists.")
     if not DRY_RUN:
         check_disk_space(src, dest.parent)
     log.info("Copy: %s → %s", src, dest)
     if not DRY_RUN:
-        # Kumpulkan daftar file dulu untuk progress bar
+        # Collect file list first for the progress bar
         src_files = [f for f in Path(src).rglob("*") if f.is_file()]
         total = len(src_files)
         counter = [0]
@@ -411,8 +411,8 @@ def safe_copytree(src: Path, dest: Path) -> None:
 
         shutil.copytree(src, dest, copy_function=_copy_fn)
         if total == 0:
-            pass  # direktori kosong, tidak ada yang di-progress
-        log.info("Selesai copy: %s \u2192 %s (%d files)", src, dest, total)
+            pass  # empty directory, no progress to show
+        log.info("Copy complete: %s \u2192 %s (%d files)", src, dest, total)
 
 
 def write_text(path, content):
@@ -426,7 +426,7 @@ def write_text(path, content):
 
 
 def load_json(path):
-    # utf-8-sig menangani BOM yang kadang muncul di file Windows
+    # utf-8-sig handles BOM that sometimes appears in Windows files
     return json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
 
 
@@ -436,10 +436,10 @@ def version_array(version):
     elif isinstance(version, str):
         result = [int(x) for x in version.split(".")]
     else:
-        raise RuntimeError(f"Format version tidak dikenal: {version}")
+        raise RuntimeError(f"Unknown version format: {version}")
     if not all(isinstance(x, int) for x in result):
-        raise RuntimeError(f"Version harus angka: {version}")
-    # Pad atau truncate ke tepat 3 elemen agar toleran terhadap manifest non-standar
+        raise RuntimeError(f"Version must be numeric: {version}")
+    # Pad or truncate to exactly 3 elements to tolerate non-standard manifests
     result = (result + [0, 0, 0])[:3]
     return result
 
@@ -471,7 +471,7 @@ def find_manifests(root):
 
 
 def scan_addon_content(root):
-    """Scan manifest dan world marker sekali jalan agar addon besar tidak discan berulang."""
+    """Scan manifests and world markers once so large addons are not scanned repeatedly."""
     manifests = []
     worlds = set()
     markers = set(WORLD_MARKERS)
@@ -493,20 +493,20 @@ def find_world_dirs(root):
 
 
 def process_nested_archives(directory: Path, max_depth: int = 10) -> None:
-    """Cari dan ekstrak file archive di dalam directory secara rekursif."""
+    """Find and extract archive files inside a directory recursively."""
     found_any = True
     nested_count = 0
-    failed: set[Path] = set()  # Track archive yang gagal agar tidak diulang
+    failed: set[Path] = set()  # Track failed archives so they are not retried
     while found_any:
         if nested_count >= max_depth:
             log.warning("Batas kedalaman nested archive tercapai (%d). Stop.", max_depth)
             break
         found_any = False
-        log.info("Scan archive bersarang: %s", directory)
+        log.info("Scan nested archives: %s", directory)
         for path in list(directory.rglob("*")):
             if path.is_file() and is_pack_file(path) and path not in failed:
                 dest_dir = path.parent / f"_extracted_{path.stem}"
-                log.info("Mengekstrak archive bersarang: %s -> %s", path.name, dest_dir.name)
+                log.info("Extracting nested archive: %s -> %s", path.name, dest_dir.name)
                 try:
                     if is_tar_file(path):
                         safe_extract_tar(path, dest_dir)
@@ -515,16 +515,16 @@ def process_nested_archives(directory: Path, max_depth: int = 10) -> None:
                     path.unlink()
                     nested_count += 1
                     found_any = True
-                    break  # Scan ulang setelah modifikasi struktur folder
+                    break  # Rescan after changing folder structure
                 except Exception as e:
-                    log.warning("Gagal mengekstrak archive bersarang %s: %s", path.name, e)
+                    log.warning("Failed to extract nested archive %s: %s", path.name, e)
                     failed.add(path)
     if nested_count > 0:
         print(f"         {c_ok(f'{nested_count} sub-pack diekstrak')}")
 
 
 def temp_extract_dir(archive: Path) -> Path:
-    """Folder extract lokal: .temp-addonInstaller/<nama-addon>."""
+    """Local extract folder: .temp-addonInstaller/<addon-name>."""
     temp_root = Path(__file__).resolve().parent / ".temp-addonInstaller"
     temp_root.mkdir(parents=True, exist_ok=True)
     name = clean_name(archive.name)
@@ -536,23 +536,23 @@ def temp_extract_dir(archive: Path) -> Path:
 
 
 def extract_archive_to_temp(archive: Path) -> Path:
-    """Ekstrak archive (zip atau tar) ke direktori temp, return path-nya."""
+    """Extract archive (zip or tar) to a temp directory and return its path."""
     tmp = temp_extract_dir(archive)
     log.info("Prepare temp: %s", tmp)
     if is_tar_file(archive):
-        log.info("Ekstrak tar: %s", archive.name)
+        log.info("Extract tar: %s", archive.name)
         safe_extract_tar(archive, tmp)
     else:
-        log.info("Ekstrak zip: %s", archive.name)
+        log.info("Extract zip: %s", archive.name)
         safe_extract(archive, tmp)
 
-    # Proses file archive bersarang (.mcpack/.zip dsb) yang ada di dalam
+    # Process nested archive files (.mcpack/.zip/etc.) inside
     process_nested_archives(tmp)
     return tmp
 
 
 def list_archives(search_dirs) -> list:
-    """Cari semua file pack/archive secara rekursif di direktori yang diberikan."""
+    """Find all pack/archive files recursively in the given directories."""
     files = []
     seen_paths: set[Path] = set()
     for directory in search_dirs:
@@ -567,41 +567,41 @@ def list_archives(search_dirs) -> list:
 
 
 def choose_archive_location(server_dir):
-    """Pilih lokasi addon/template lewat menu interaktif."""
+    """Choose addon/template location through an interactive menu."""
     cwd = Path.cwd().resolve()
 
     while True:
-        print(f"\n{c_bold('Lokasi addon/template')}")
-        print(f"  1) List folder yang ada di {cwd.name}/")
-        print(f"  2) Scan folder server ({server_dir.name}/)")
-        print("  3) Masukkan manual path folder/file")
-        choice = ask("Pilih opsi", "1")
+        print(f"\n{c_bold('Addon/template location')}")
+        print(f"  1) List folders in {cwd.name}/")
+        print(f"  2) Scan server folder ({server_dir.name}/)")
+        print("  3) Enter a manual path folder/file")
+        choice = ask("Choose an option", "1")
 
         if choice == "1":
             folders = sorted([p for p in cwd.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
-            # Sembunyikan folder internal
+            # Hide internal folders
             folders = [f for f in folders if not f.name.startswith((".") ) and f.name != "__pycache__"]
             if not folders:
-                print("Tidak ada folder di directory ini.")
+                print("No folders in this directory.")
                 continue
-            print(f"\nFolder di {cwd.name}/:")
+            print(f"\nFolders in {cwd.name}/:")
             for idx, folder in enumerate(folders, 1):
                 count = sum(1 for _ in folder.rglob("*") if _.is_file() and is_pack_file(_))
-                count_str = c_gray(f"({count} file)") if count > 0 else c_gray("(kosong)")
+                count_str = c_gray(f"({count} file)") if count > 0 else c_gray("(empty)")
                 print(f"  {idx}) {folder.name}/ {count_str}")
-            raw = ask("Pilih nomor folder")
+            raw = ask("Choose folder number")
             try:
                 index = int(raw)
             except (TypeError, ValueError):
-                print("Pilihan harus angka.")
+                print("Choice must be a number.")
                 continue
             if index < 1 or index > len(folders):
-                print("Pilihan folder tidak valid.")
+                print("Invalid folder choice.")
                 continue
             picked = folders[index - 1]
             pick_count = sum(1 for _ in picked.rglob("*") if _.is_file() and is_pack_file(_))
             if pick_count == 0:
-                print(c_warn(f"Folder {picked.name}/ tidak ada file addon. Pilih folder lain."))
+                print(c_warn(f"Folder {picked.name}/ has no addon files. Choose another folder."))
                 continue
             return picked
 
@@ -609,20 +609,20 @@ def choose_archive_location(server_dir):
             return server_dir.resolve()
 
         if choice == "3":
-            manual = ask("Path folder/file addon/template", str(cwd))
+            manual = ask("Addon/template folder/file path", str(cwd))
             if not manual:
                 continue
             path = Path(manual).expanduser().resolve()
             if not path.exists():
-                print(f"Path tidak ada: {path}")
+                print(f"Path does not exist: {path}")
                 continue
             return path
 
-        print("Pilih 1, 2, atau 3.")
+        print("Choose 1, 2, or 3.")
 
 
 def get_key():
-    """Baca satu tombol untuk picker interaktif."""
+    """Read one key for the interactive picker."""
     if sys.platform == "win32":
         import msvcrt
         key = msvcrt.getch()
@@ -666,22 +666,22 @@ def get_key():
 
 
 def render_checkbox_picker(candidates, selected, cursor, search_dirs):
-    """Render picker addon interaktif."""
+    """Render the interactive addon picker."""
     print("\033[2J\033[H", end="")
     scan_names = ", ".join(d.name for d in search_dirs if d.exists())
-    print(f"Addon/template ditemukan: {c_gray(f'({len(candidates)} file)')}")
+    print(f"Addon/template found: {c_gray(f'({len(candidates)} file)')}")
     print(f"{c_gray(f'Scan: {scan_names}')}")
     for i, path in enumerate(candidates):
         pointer = ">" if i == cursor else " "
         mark = "x" if i in selected else " "
         folder = c_gray(f'({path.parent.name}/)')
         print(f"  {pointer} [{mark}] {i + 1}. {path.name} {folder}")
-    print("\n\u2191/\u2193 pilih addon, Space centang/uncentang, Enter install yang dicentang")
-    print("a pilih semua, c kosongkan, r refresh, m input manual, q batal")
+    print("\n\u2191/\u2193 choose addon, Space toggle, Enter install selected items")
+    print("a select all, c clear, r refresh, m manual input, q cancel")
 
 
 def choose_archives_keyboard(candidates, search_dirs):
-    """Pilih addon dengan tombol panah + Space."""
+    """Choose addons with arrow keys + Space."""
     if not candidates:
         return []
     cursor = 0
@@ -716,16 +716,16 @@ def choose_archives_keyboard(candidates, search_dirs):
             cursor = min(cursor, max(len(candidates) - 1, 0))
         elif key == "m":
             print()
-            manual = ask("Path file")
+            manual = ask("File path")
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(f"File tidak ada: {manual_path}")
-                    input("Tekan Enter untuk lanjut...")
+                    print(f"File does not exist: {manual_path}")
+                    input("Press Enter to continue...")
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(f"File bukan addon/template/archive Bedrock: {manual_path}")
-                    input("Tekan Enter untuk lanjut...")
+                    print(f"File is not a Bedrock addon/template/archive: {manual_path}")
+                    input("Press Enter to continue...")
                     continue
                 candidates.append(manual_path)
                 selected.add(len(candidates) - 1)
@@ -739,19 +739,19 @@ def choose_archives_text(candidates, search_dirs):
     """Fallback picker addon berbasis input teks."""
     selected = set()
     while True:
-        print(f"\nAddon/template ditemukan: ({len(candidates)} file)")
+        print(f"\nAddon/template found: ({len(candidates)} file)")
         for i, path in enumerate(candidates, 1):
             mark = "x" if i in selected else " "
             folder = f'({path.parent.name}/)'
             print(f"  [{mark}] {i}. {path.name} {folder}")
-        print("\nKetik nomor untuk centang/uncentang. Contoh: 1 atau 1,3")
-        print("  a. Pilih semua")
-        print("  c. Kosongkan pilihan")
-        print("  r. Refresh (scan ulang folder)")
-        print("  0. Input path manual file")
-        print("  kosong. Install yang dicentang")
+        print("\nType numbers to toggle selection. Example: 1 or 1,3")
+        print("  a. Select all")
+        print("  c. Clear selection")
+        print("  r. Refresh (rescan folders)")
+        print("  0. Enter manual file path")
+        print("  empty. Install selected items")
 
-        choice = ask("Pilih addon/template", "")
+        choice = ask("Choose addon/template", "")
         if choice == "":
             break
         if choice.lower() == "a":
@@ -768,17 +768,17 @@ def choose_archives_text(candidates, search_dirs):
             for i, path in enumerate(candidates, 1):
                 if path in old_selected_paths:
                     selected.add(i)
-            print(f"Refreshed! {len(candidates)} file ditemukan.")
+            print(f"Refreshed! {len(candidates)} file(s) found.")
             continue
         if choice == "0":
-            manual = ask("Path file")
+            manual = ask("File path")
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(f"File tidak ada: {manual_path}")
+                    print(f"File does not exist: {manual_path}")
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(f"File bukan addon/template/archive Bedrock: {manual_path}")
+                    print(f"File is not a Bedrock addon/template/archive: {manual_path}")
                     continue
                 candidates.append(manual_path)
                 selected.add(len(candidates))
@@ -798,7 +798,7 @@ def choose_archives_text(candidates, search_dirs):
             else:
                 selected.add(index)
         if not ok:
-            print("Pilihan tidak valid. Pakai nomor, contoh: 1 atau 1,3")
+            print("Invalid choice. Use numbers, example: 1 or 1,3")
 
     return [candidates[i - 1] for i in sorted(selected)]
 
@@ -808,7 +808,7 @@ def choose_archives(server_dir):
         source = choose_archive_location(server_dir)
         if source.is_file():
             if not is_pack_file(source):
-                print(f"File bukan addon/template/archive Bedrock: {source}")
+                print(f"File is not a Bedrock addon/template/archive: {source}")
                 continue
             return [source]
 
@@ -816,8 +816,8 @@ def choose_archives(server_dir):
         candidates = list_archives(search_dirs)
         if candidates:
             break
-        print(f"\nTidak ada .mcpack/.mcaddon/.mctemplate/.zip/.tar.gz di: {source.name}/")
-        print("Pilih lokasi lain.")
+        print(f"\nNo .mcpack/.mcaddon/.mctemplate/.zip/.tar.gz files in: {source.name}/")
+        print("Choose another location.")
 
     if sys.stdin.isatty():
         return choose_archives_keyboard(candidates, search_dirs)
@@ -838,17 +838,17 @@ def manifest_dependencies(manifest):
 def install_pack_dir(pack_dir, manifest, server_dir):
     kinds = detect_pack_kinds(manifest)
     if not kinds:
-        msg = f"Skip {pack_dir}: bukan RP/BP Bedrock"
+        msg = f"Skip {pack_dir}: not a Bedrock RP/BP"
         print(msg)
         log.warning(msg)
         return []
 
     header = manifest.get("header", {})
     pack_id = header.get("uuid")
-    # Validasi UUID format sebelum dipakai
+    # Validate UUID format before use
     validate_uuid(pack_id, context=str(pack_dir))
     version = version_array(header.get("version"))
-    log.info("Pack ditemukan: %s | kind=%s | uuid=%s | version=%s",
+    log.info("Pack found: %s | kind=%s | uuid=%s | version=%s",
              header.get('name', pack_dir.name), kinds, pack_id, version)
 
     installed = []
@@ -881,14 +881,14 @@ def import_world_dir(src_world, server_dir):
     levelname_file = src_world / "levelname.txt"
     default_name = levelname_file.read_text(errors="ignore").strip() if levelname_file.exists() else src_world.name
     default_name = default_name or src_world.name
-    world_name = safe_world_name(ask(f"Nama world import dari template {src_world.name}", default_name))
+    world_name = safe_world_name(ask(f"World name to import from template {src_world.name}", default_name))
     dest = safe_child_path(worlds_dir, world_name, world_name)
     safe_copytree(src_world, dest)
     return dest
 
 
 def load_manifests_from_archive(archive: Path):
-    """Baca manifest.json langsung dari archive tanpa extract penuh."""
+    """Read manifest.json directly from the archive without full extraction."""
     manifests = []
     if is_tar_file(archive):
         with tarfile.open(archive) as tf:
@@ -919,7 +919,7 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     validate_uuid(pack_id, f"manifest {manifest_name} header.uuid")
     kinds = detect_pack_kinds(manifest)
     if not kinds:
-        print(f"Lewati manifest tanpa module resource/data: {manifest_name}")
+        print(f"Skip manifest without resource/data module: {manifest_name}")
         return installed
 
     for kind in kinds:
@@ -948,19 +948,19 @@ def archive_stem_from_manifest(manifest_name: str) -> str:
 
 def process_archive(archive, server_dir):
     archive = Path(archive).expanduser().resolve()
-    # Validasi ukuran & integritas archive sebelum diekstrak
+    # Validate archive size and integrity before extraction
     validate_archive(archive)
     size_mb = archive.stat().st_size / (1024 * 1024)
 
     if DRY_RUN:
-        print(f"         {c_yellow('[DRY-RUN] Baca manifest tanpa extract penuh')}")
+        print(f"         {c_yellow('[DRY-RUN] Reading manifest without full extraction')}")
         installed = []
         for manifest_name, manifest in load_manifests_from_archive(archive):
             installed.extend(dry_run_install_manifest(manifest_name, manifest, server_dir))
         return installed, []
 
-    # Step: Ekstrak
-    print(f"         {c_info(f'Mengekstrak ({size_mb:.1f} MB)...')}")
+    # Step: Extract
+    print(f"         {c_info(f'Extracting ({size_mb:.1f} MB)...')}")
     tmp = extract_archive_to_temp(archive)
     installed = []
     imported_worlds = []
@@ -968,7 +968,7 @@ def process_archive(archive, server_dir):
         # Step: Scan isi
         manifests, world_dirs = scan_addon_content(tmp)
         pack_count = len(manifests)
-        print(f"         {c_ok(f'{pack_count} pack ditemukan')}")
+        print(f"         {c_ok(f'{pack_count} pack(s) found')}")
 
         # Step: Install pack
         for manifest_path in manifests:
@@ -983,7 +983,7 @@ def process_archive(archive, server_dir):
             installed.extend(result)
 
         for world_dir in world_dirs:
-            if yes_no(f"Template/world terdeteksi: {world_dir.name}. Import world?", True):
+            if yes_no(f"Template/world detected: {world_dir.name}. Import world?", True):
                 imported_worlds.append(import_world_dir(world_dir, server_dir))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -998,7 +998,7 @@ def read_pack_list(path):
         return data if isinstance(data, list) else []
     except json.JSONDecodeError:
         backup_existing(path)
-        print(f"JSON rusak: {path}. Akan ditulis ulang list kosong + pack baru.")
+        print(f"Broken JSON: {path}. It will be rewritten as an empty list plus new packs.")
         return []
 
 
@@ -1045,22 +1045,22 @@ def set_texturepack_required(server_dir):
 
 def choose_world(server_dir, imported_worlds):
     if imported_worlds:
-        print("\nWorld hasil import:")
+        print("\nImported worlds:")
         for i, w in enumerate(imported_worlds, 1):
             print(f"  {i}. {w.name}")
-        if yes_no("Pakai world import ini untuk enable pack?", True):
+        if yes_no("Use this imported world to enable packs?", True):
             if len(imported_worlds) == 1:
                 return imported_worlds[0]
-            # Perbaikan: tangani input non-integer agar tidak crash
+            # Handle non-integer input without crashing
             while True:
-                raw = ask("Pilih world import", "1")
+                raw = ask("Choose imported world", "1")
                 try:
                     idx = int(raw)
                     if 1 <= idx <= len(imported_worlds):
                         return imported_worlds[idx - 1]
-                    print(f"Pilih angka 1-{len(imported_worlds)}.")
+                    print(f"Choose a number 1-{len(imported_worlds)}.")
                 except ValueError:
-                    print("Masukkan angka yang valid.")
+                    print("Enter a valid number.")
 
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
@@ -1070,33 +1070,33 @@ def choose_world(server_dir, imported_worlds):
     existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
 
     if existing:
-        print("\nWorld folder ditemukan:")
+        print("\nWorld folders found:")
         for i, w in enumerate(existing, 1):
             print(f"  {i}. {w.name}")
-        print("  0. Buat/pakai nama lain")
-        # Perbaikan: tangani input non-integer agar tidak crash
+        print("  0. Create/use another name")
+        # Handle non-integer input without crashing
         while True:
-            choice = ask("Pilih world", "1")
+            choice = ask("Choose world", "1")
             try:
                 idx = int(choice)
                 if idx == 0:
                     break
                 if 1 <= idx <= len(existing):
                     return existing[idx - 1]
-                print(f"Pilih angka 0-{len(existing)}.")
+                print(f"Choose a number 0-{len(existing)}.")
             except ValueError:
-                print("Masukkan angka yang valid.")
+                print("Enter a valid number.")
 
     prop_name = read_server_level_name(server_dir)
     default_name = prop_name or "Bedrock level"
 
-    print(c_warn("Belum ada world folder di server ini."))
-    print(f"Nama default dari server.properties: {c_bold(default_name)}")
+    print(c_warn("No world folder exists in this server yet."))
+    print(f"Default name from server.properties: {c_bold(default_name)}")
 
-    if yes_no(f"Buat world dengan nama \"{default_name}\"?", True):
+    if yes_no(f"Create world named \"{default_name}\"?", True):
         world_name = safe_world_name(default_name)
     else:
-        world_name = safe_world_name(ask("Masukkan nama world", default_name))
+        world_name = safe_world_name(ask("Enter world name", default_name))
 
     world_dir = safe_child_path(worlds_dir, world_name, world_name)
     if not DRY_RUN:
@@ -1117,7 +1117,7 @@ def check_dependencies(installed):
 
 
 def _tick(cond: bool) -> str:
-    """Simbol centang/silang dengan warna jika tersedia."""
+    """Check/cross symbol with color when available."""
     if _COLOR_ENABLED:
         return c_green("[\u2713]") if cond else c_gray("[ ]")
     return "[✓]" if cond else "[ ]"
@@ -1128,7 +1128,7 @@ def print_summary(archive_results, dep_missing) -> None:
     for archive_name, packs, worlds in archive_results:
         print(f"\n{c_bold('== Summary ==')} {c_cyan(archive_name)}")
 
-        # Tampilkan nama addon yang dikerjakan beserta UUID
+        # Show processed addon name and UUID
         seen = set()
         for p in packs:
             pid = p["pack_id"]
@@ -1136,7 +1136,7 @@ def print_summary(archive_results, dep_missing) -> None:
                 seen.add(pid)
                 print(f"{c_ok(p['name'])} {c_gray('(' + pid + ')')}")
 
-        # Tampilkan Dry-run hanya jika di-enable (DRY_RUN = True)
+        # Show Dry-run only when enabled (DRY_RUN = True)
         if DRY_RUN:
             print("Dry-run      : Yes")
 
@@ -1169,12 +1169,12 @@ def print_summary(archive_results, dep_missing) -> None:
         if local_missing:
             print(f"Missing deps : {len(local_missing)} item")
             for pack, dep in local_missing:
-                print(f"  {c_err(pack['name'])} perlu {c_yellow(dep['uuid'])} versi {dep.get('version')}")
+                print(f"  {c_err(pack['name'])} needs {c_yellow(dep['uuid'])} version {dep.get('version')}")
         else:
             print("Missing deps : Nothing")
 
 
-# Prefix/pattern folder bawaan Minecraft yang TIDAK boleh dihapus
+# Built-in Minecraft folder prefixes/patterns that must not be deleted
 _BUILTIN_PREFIXES = (
     "vanilla", "chemistry", "editor", "experimental_",
     "server_editor_library", "server_library", "server_ui_library",
@@ -1182,7 +1182,7 @@ _BUILTIN_PREFIXES = (
 
 
 def _is_builtin_pack(folder_name: str) -> bool:
-    """Cek apakah folder ini adalah pack bawaan Minecraft server."""
+    """Check whether this folder is a built-in Minecraft server pack."""
     name_lower = folder_name.lower()
     # Skip folder backup (.bak-)
     if ".bak-" in name_lower:
@@ -1192,7 +1192,7 @@ def _is_builtin_pack(folder_name: str) -> bool:
 
 
 def get_installed_addons(server_dir):
-    """Scan addon yang diinstall user saja (skip bawaan Minecraft & backup)."""
+    """Scan only user-installed addons, skipping Minecraft built-ins and backups."""
     installed = []
     for kind, folder_name in [("rp", "resource_packs"), ("bp", "behavior_packs")]:
         base = server_dir / folder_name
@@ -1202,7 +1202,7 @@ def get_installed_addons(server_dir):
             if not pack_dir.is_dir():
                 continue
             if _is_builtin_pack(pack_dir.name):
-                log.debug("Skip bawaan/backup: %s", pack_dir.name)
+                log.debug("Skip built-in/backup: %s", pack_dir.name)
                 continue
             manifest_path = pack_dir / "manifest.json"
             if not manifest_path.exists():
@@ -1222,14 +1222,14 @@ def get_installed_addons(server_dir):
 
 def render_checkbox_picker_addons(candidates, selected, cursor):
     print("\033[2J\033[H", end="")
-    print("Addon terinstall ditemukan:")
+    print("Installed addons found:")
     for i, p in enumerate(candidates):
         pointer = ">" if i == cursor else " "
         mark = "x" if i in selected else " "
         kind_str = "RP" if p["kind"] == "rp" else "BP"
         print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} ({p['path'].name})")
-    print("\n↑/↓ pilih addon, Space centang/uncentang, Enter hapus yang dicentang")
-    print("a pilih semua, c kosongkan, q batal")
+    print("\n↑/↓ choose addon, Space toggle, Enter delete selected items")
+    print("a select all, c clear, q cancel")
 
 def choose_addons_keyboard(candidates):
     if not candidates:
@@ -1262,14 +1262,14 @@ def choose_addons_keyboard(candidates):
 def choose_addons_text(candidates):
     selected = set()
     while True:
-        print("\nAddon terinstall:")
+        print("\nInstalled addons:")
         for i, p in enumerate(candidates, 1):
             mark = "x" if i in selected else " "
             kind_str = "RP" if p["kind"] == "rp" else "BP"
             print(f"  [{mark}] {i}. [{kind_str}] {p['name']} ({p['path'].name})")
-        print("\nKetik nomor untuk centang/uncentang (contoh: 1 atau 1,3). a=semua, c=kosong, kosong=Lanjut")
+        print("\nType numbers to toggle selection (example: 1 or 1,3). a=all, c=clear, empty=Continue")
         
-        choice = ask("Pilih addon yang mau dihapus", "")
+        choice = ask("Choose addon to delete", "")
         if choice == "":
             break
         if choice.lower() == "a":
@@ -1293,12 +1293,12 @@ def choose_addons_text(candidates):
             else:
                 selected.add(index)
         if not ok:
-            print("Pilihan tidak valid.")
+            print("Invalid choice.")
     
     return [candidates[i - 1] for i in sorted(selected)]
 
 def disable_pack_in_world(world_dir, pack):
-    """Hapus pack dari world JSON config (silent, hanya log ke file)."""
+    """Remove pack from world JSON config silently, only logging to file."""
     if not pack.get("pack_id"):
         return False
     file_name = "world_resource_packs.json" if pack["kind"] == "rp" else "world_behavior_packs.json"
@@ -1319,7 +1319,7 @@ def disable_pack_in_world(world_dir, pack):
 def uninstall_addon_flow(server_dir):
     candidates = get_installed_addons(server_dir)
     if not candidates:
-        print(c_warn("Tidak ada addon yang terinstall."))
+        print(c_warn("No installed addons found."))
         return
     
     if sys.stdin.isatty():
@@ -1328,22 +1328,22 @@ def uninstall_addon_flow(server_dir):
         to_remove = choose_addons_text(candidates)
         
     if not to_remove:
-        print("Dibatalkan, tidak ada yang dihapus.")
+        print("Cancelled, nothing was deleted.")
         return
     
-    # Konfirmasi sebelum hapus - PERINGATAN KERAS
+    # Confirmation before deletion - strong warning
     print(f"\n{c_red('!' * 50)}")
-    print(f"{c_bold(c_red('  ⚠  PERINGATAN: PENGHAPUSAN PERMANEN  ⚠'))}")
+    print(f"{c_bold(c_red('  ⚠  WARNING: PERMANENT DELETION  ⚠'))}")
     print(f"{c_red('!' * 50)}")
-    print(f"\n{c_bold('Addon yang akan dihapus:')}")
+    print(f"\n{c_bold('Addons to be deleted:')}")
     for i, pack in enumerate(to_remove, 1):
         kind_str = c_cyan("RP") if pack["kind"] == "rp" else c_cyan("BP")
         print(f"  {c_red('✗')} {i}. [{kind_str}] {c_bold(pack['name'])}")
-    print(f"\n{c_red('File addon akan DIHAPUS PERMANEN dan TIDAK BISA dikembalikan!')}")
+    print(f"\n{c_red('Addon files will be PERMANENTLY DELETED and CANNOT be restored!')}")
     
-    confirm = ask(f"\nKetik {c_bold('HAPUS')} untuk konfirmasi, atau tekan Enter untuk batal")
-    if confirm != "HAPUS":
-        print("Dibatalkan.")
+    confirm = ask(f"\nType {c_bold('DELETE')} to confirm, or press Enter to cancel")
+    if confirm != "DELETE":
+        print("Cancelled.")
         return
 
     worlds_dir = server_dir / "worlds"
@@ -1352,38 +1352,38 @@ def uninstall_addon_flow(server_dir):
     total = len(to_remove)
     removed_names = []
     
-    print(c_divider(f"Menghapus {total} addon"))
+    print(c_divider(f"Deleting {total} addon"))
     for idx, pack in enumerate(to_remove, 1):
         pack_path = pack["path"]
         kind_label = "RP" if pack["kind"] == "rp" else "BP"
         
         print(f"\n  [{idx}/{total}] {c_bold(pack['name'])} ({kind_label})")
         
-        # Hapus folder permanen
+        # Permanently delete folder
         if not DRY_RUN and pack_path.exists():
-            log.info("Hapus permanen: %s", pack_path)
+            log.info("Permanently delete: %s", pack_path)
             shutil.rmtree(pack_path)
-            print(f"         {c_ok('Folder dihapus')}")
+            print(f"         {c_ok('Folder deleted')}")
         elif DRY_RUN:
-            print(f"         {c_yellow('[DRY-RUN] Akan dihapus')}")
+            print(f"         {c_yellow('[DRY-RUN] Would delete')}")
         
-        # Hapus dari world config
+        # Remove from world config
         cleaned_worlds = 0
         for w in existing_worlds:
             if disable_pack_in_world(w, pack):
                 cleaned_worlds += 1
         if cleaned_worlds > 0:
-            print(f"         {c_ok(f'Dicopot dari {cleaned_worlds} world')}")
+            print(f"         {c_ok(f'Removed from {cleaned_worlds} world')}")
         
         removed_names.append(f"[{kind_label}] {pack['name']}")
     
     # Summary akhir
-    print(c_divider("Uninstall Selesai"))
-    print(f"  Total dihapus: {c_green(str(total))} addon")
+    print(c_divider("Uninstall Complete"))
+    print(f"  Total deleted: {c_green(str(total))} addon")
     for name in removed_names:
         print(f"  {c_ok(name)}")
     print(c_divider())
-    print(f"  {c_green('\U0001F680 Restart bedrock_server untuk menerapkan perubahan.')}")
+    print(f"  {c_green('\U0001F680 Restart bedrock_server to apply changes.')}")
     print()
 
 
@@ -1408,47 +1408,47 @@ def main():
     log_file = setup_logging()
     _enable_colors()
     if DRY_RUN:
-        log.info("Mode DRY-RUN aktif")
+        log.info("DRY-RUN mode enabled")
 
     print(c_divider("⛏  Bedrock Addon Installer by @zoxervy"))
     print(c_gray(f"Log: {log_file.resolve()}"))
     if DRY_RUN:
-        print(c_yellow("Mode: DRY-RUN aktif, tidak ada file yang ditulis."))
+        print(c_yellow("Mode: DRY-RUN enabled, no files will be written."))
 
-    # Step 1: Pilih server
-    print(c_divider("Step 1: Pilih Server"))
+    # Step 1: Choose server
+    print(c_divider("Step 1: Choose Server"))
     server_dir = choose_server_dir()
     print(f"{c_ok(f'Server: {server_dir.name}/')}")
 
-    # Step 2: Pilih aksi
-    print(c_divider("Step 2: Pilih Aksi"))
+    # Step 2: Choose action
+    print(c_divider("Step 2: Choose Action"))
     print("  1) \U0001F4E5 Install Addon")
     print("  2) \U0001F5D1  Uninstall Addon")
     while True:
-        action_choice = ask("Pilih aksi", "1")
+        action_choice = ask("Choose action", "1")
         if action_choice in ("1", "2"):
             break
-        print("Pilih 1 atau 2.")
+        print("Choose 1 or 2.")
 
     if action_choice == "2":
         print(c_divider("Uninstall Addon"))
         uninstall_addon_flow(server_dir)
         return
 
-    # Step 3: Pilih addon
-    print(c_divider("Step 3: Pilih Addon"))
+    # Step 3: Choose addons
+    print(c_divider("Step 3: Choose Addons"))
     archives = choose_archives(server_dir)
     if not archives:
-        print(c_warn("Tidak ada file dipilih."))
+        print(c_warn("No files selected."))
         return
-    print(f"{c_ok(f'{len(archives)} addon dipilih')}")
+    print(f"{c_ok(f'{len(archives)} addon(s) selected')}")
 
     installed = []
     imported_worlds = []
     archive_results = []  # track per-archive results untuk summary
     total_archives = len(archives)
 
-    # Step 4: Proses install
+    # Step 4: Process install
     print(c_divider(f"Step 4: Install ({total_archives} addon)"))
     for idx, archive in enumerate(archives, 1):
         size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
@@ -1459,16 +1459,16 @@ def main():
         archive_results.append((archive.name, packs, worlds))
 
     if not installed:
-        print(f"\n{c_warn('Tidak ada RP/BP dipasang.')}")
+        print(f"\n{c_warn('No RP/BP packs were installed.')}")
         return
 
-    # Step 5: Pilih world target
-    print(c_divider("Step 5: Pilih World"))
+    # Step 5: Choose target world
+    print(c_divider("Step 5: Choose World"))
     world_dir = choose_world(server_dir, imported_worlds)
     print(f"{c_ok(f'World: {world_dir.name}')}")
 
-    # Step 6: Aktifkan pack di world
-    print(c_divider("Step 6: Aktifkan Pack"))
+    # Step 6: Enable packs in world
+    print(c_divider("Step 6: Enable Packs"))
     for pack in installed:
         kind_label = "RP" if pack["kind"] == "rp" else "BP"
         json_file = "world_resource_packs.json" if pack["kind"] == "rp" else "world_behavior_packs.json"
@@ -1478,7 +1478,7 @@ def main():
 
     if any(pack["kind"] == "rp" for pack in installed):
         if not check_texturepack_required(server_dir):
-            if yes_no("\nSet texturepack-required=true biar client otomatis download pack?", True):
+            if yes_no("\nSet texturepack-required=true so clients automatically download the pack?", True):
                 set_texturepack_required(server_dir)
                 print(f"  {c_ok('texturepack-required=true')}")
 
@@ -1486,8 +1486,8 @@ def main():
     dep_missing = check_dependencies(installed)
     print_summary(archive_results, dep_missing)
     print(c_divider())
-    print(f"  {c_green('\U0001F680 Restart bedrock_server untuk menerapkan perubahan.')}")
-    print(f"  {c_gray('Backup file (.bak-*) tetap tersimpan jika ingin di-restore.')}")
+    print(f"  {c_green('\U0001F680 Restart bedrock_server to apply changes.')}")
+    print(f"  {c_gray('Backup files (.bak-*) are kept in case you want to restore them.')}")
     print()
 
 
@@ -1496,7 +1496,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{c_yellow('Dibatalkan.')}")
+        print(f"\n{c_yellow('Cancelled.')}")
     except Exception as e:
         print(c_err(f"Error: {e}") if _COLOR_ENABLED else f"Error: {e}")
         log.exception("Fatal error")
