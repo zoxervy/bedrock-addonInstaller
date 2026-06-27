@@ -498,37 +498,3 @@ Look for backup files ending with:
 ```text
 .bak-YYYYMMDD-HHMMSS
 ```
-
-## Git/GitHub notes
-
-This folder was not a Git repository when checked.
-
-If you want to upload the script to GitHub:
-
-```bash
-git init
-git add addonInstaller.py README.md
-git commit -m "Add Bedrock addon installer"
-git branch -M main
-git remote add origin <GITHUB_REPO_URL>
-git push -u origin main
-```
-
-Do not blindly push `.mcpack`, `.mcaddon`, `.mctemplate`, or large ZIP files to a public repository.
-
-These files may be:
-
-- copyrighted third-party content
-- large binary assets
-- unsuitable for public Git history
-
-Recommended public repo contents:
-
-```text
-addonInstaller.py
-README.md
-```
-
-Decide separately whether `.addons/` should be tracked.
-
-I will not push anything unless you explicitly approve it first.
