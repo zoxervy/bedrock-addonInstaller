@@ -12,15 +12,6 @@ bedrock-addonInstaller/
 └─ README.md          # usage guide and technical notes
 ```
 
-Optional local folders you may create/use:
-
-```text
-.addons/              # place addon files here before installing
-resource_packs/       # created/used when running inside a Bedrock server
-behavior_packs/       # created/used when running inside a Bedrock server
-worlds/               # Bedrock worlds folder
-```
-
 ## Requirements
 
 - Python 3
