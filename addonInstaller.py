@@ -177,7 +177,7 @@ def yes_no(prompt, default=True):
             return default
         if value in ("y", "yes", "ya", "iya"):
             return True
-        if value in ("n", "no", "tidak", "ga", "gak"):
+        if value in ("n", "no"):
             return False
         print("Answer y/n.")
 
@@ -283,7 +283,7 @@ def choose_server_dir():
 
 def validate_uuid(uuid, context=""):
     """Validate standard UUID format (8-4-4-4-12 hex)."""
-    label = f" di {context}" if context else ""
+    label = f" in {context}" if context else ""
     if not uuid or not UUID_RE.match(uuid):
         raise RuntimeError(f"Invalid UUID{label}: {uuid!r}")
 
@@ -348,7 +348,7 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
             copied += 1
             if total and (copied == total or copied % 25 == 0):
                 print_progress(copied, total, Path(member.filename).name)
-        pass  # progress bar sudah newline sendiri
+        pass  # progress bar already writes its own newline
 
 
 def safe_extract_tar(tar_path: Path, dest: Path) -> None:
@@ -380,7 +380,7 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
             copied += 1
             if total and (copied == total or copied % 25 == 0):
                 print_progress(copied, total, Path(member.name).name)
-        pass  # progress bar sudah newline sendiri
+        pass  # progress bar already writes its own newline
 
 
 
@@ -911,7 +911,7 @@ def load_manifests_from_archive(archive: Path):
 
 
 def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Path):
-    """Simulasi install pack dari manifest tanpa extract archive penuh."""
+    """Simulate pack installation from manifest without full archive extraction."""
     installed = []
     header = manifest.get("header", {})
     pack_id = header.get("uuid")
@@ -965,7 +965,7 @@ def process_archive(archive, server_dir):
     installed = []
     imported_worlds = []
     try:
-        # Step: Scan isi
+        # Step: Scan content
         manifests, world_dirs = scan_addon_content(tmp)
         pack_count = len(manifests)
         print(f"         {c_ok(f'{pack_count} pack(s) found')}")
@@ -1039,7 +1039,7 @@ def set_texturepack_required(server_dir):
             new_lines.append(line)
     if not found:
         new_lines.append("texturepack-required=true")
-    # Gunakan newline konsisten (\n) agar kompatibel di semua platform
+    # Use consistent newlines (\n) for cross-platform compatibility
     write_text(props, "\n".join(new_lines) + "\n")
 
 
@@ -1217,7 +1217,7 @@ def get_installed_addons(server_dir):
                     "kind": kind
                 })
             except Exception as e:
-                log.warning("Gagal baca %s: %s", manifest_path, e)
+                log.warning("Failed to read %s: %s", manifest_path, e)
     return installed
 
 def render_checkbox_picker_addons(candidates, selected, cursor):
@@ -1445,7 +1445,7 @@ def main():
 
     installed = []
     imported_worlds = []
-    archive_results = []  # track per-archive results untuk summary
+    archive_results = []  # track per-archive results for summary
     total_archives = len(archives)
 
     # Step 4: Process install
