@@ -7,12 +7,18 @@ It supports resource packs, behavior packs, combined addons, nested addon archiv
 ## Project files
 
 ```text
-mc server/
-├─ addonInstaller.py              # main installer script
-├─ .addonInstaller/addonInstaller.py
-├─ .addons/                       # suggested addon input folder
-├─ README.md                      # usage + technical notes
-└─ __pycache__/                   # Python cache, safe to ignore
+bedrock-addonInstaller/
+├─ addonInstaller.py  # main installer script
+└─ README.md          # usage guide and technical notes
+```
+
+Optional local folders you may create/use:
+
+```text
+.addons/              # place addon files here before installing
+resource_packs/       # created/used when running inside a Bedrock server
+behavior_packs/       # created/used when running inside a Bedrock server
+worlds/               # Bedrock worlds folder
 ```
 
 ## Requirements
