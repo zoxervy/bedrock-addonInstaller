@@ -69,19 +69,20 @@ def setup_logging():
     log.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    log_file = Path("addonInstaller.log")
-    log_file_resolved = log_file.resolve()
+    log_file = None if DRY_RUN else Path("addonInstaller.log")
 
-    has_file_handler = any(
-        isinstance(handler, logging.FileHandler)
-        and Path(handler.baseFilename).resolve() == log_file_resolved
-        for handler in log.handlers
-    )
-    if not has_file_handler:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        log.addHandler(fh)
+    if log_file is not None:
+        log_file_resolved = log_file.resolve()
+        has_file_handler = any(
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == log_file_resolved
+            for handler in log.handlers
+        )
+        if not has_file_handler:
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
 
     has_stderr_handler = any(
         isinstance(handler, logging.StreamHandler)
@@ -96,7 +97,7 @@ def setup_logging():
         log.addHandler(sh)
 
     log.info("=" * 60)
-    log.info("Bedrock Addon Setup dimulai")
+    log.info("Bedrock Addon Setup started")
     log.info("Platform: %s | Python: %s", sys.platform, sys.version.split()[0])
     return log_file
 
@@ -141,8 +142,51 @@ def c_warn(t: str)   -> str: return c_yellow(f"\u26a0 {t}")
 def c_err(t: str)    -> str: return c_red(f"\u2717 {t}")
 def c_info(t: str)   -> str: return c_cyan(f"\u2192 {t}")
 def c_divider(t: str = "") -> str:
-    line = "\u2500" * 50
+    line = "\u2500" * 58
     return c_gray(f"\n{line}") if not t else f"\n{c_bold(t)}\n{c_gray(line)}"
+
+
+def ui_banner(log_file) -> None:
+    """Print the app banner and current runtime mode."""
+    width = 58
+    title = "Bedrock Addon Installer"
+    subtitle = "Install, enable, and remove Minecraft Bedrock addons"
+    print()
+    print(c_cyan("\u2554" + "\u2550" * width + "\u2557"))
+    print(c_cyan("\u2551") + c_bold(f" {title}".ljust(width)) + c_cyan("\u2551"))
+    print(c_cyan("\u2551") + c_gray(f" {subtitle}".ljust(width)) + c_cyan("\u2551"))
+    print(c_cyan("\u255a" + "\u2550" * width + "\u255d"))
+    print(f"  {c_gray('Author')}  @zoxervy")
+    if log_file is not None:
+        print(f"  {c_gray('Log')}     {log_file.resolve()}")
+    else:
+        print(f"  {c_gray('Log')}     disabled in dry-run mode")
+    if DRY_RUN:
+        print(f"  {c_yellow('Mode')}    DRY-RUN, no files will be written")
+
+
+def ui_option(key: str, label: str, detail: str = "") -> None:
+    """Print a menu option with aligned label and detail."""
+    suffix = f" {c_gray(detail)}" if detail else ""
+    print(f"  {c_cyan(str(key) + ')')} {label}{suffix}")
+
+
+def ui_hint(text: str) -> None:
+    print(f"  {c_gray(text)}")
+
+
+def ui_empty(title: str, detail: str = "") -> None:
+    print(c_warn(title))
+    if detail:
+        ui_hint(detail)
+
+
+def plural(count: int, word: str) -> str:
+    if count == 1:
+        return f"{count} {word}"
+    if word.endswith("y"):
+        return f"{count} {word[:-1]}ies"
+    return f"{count} {word}s"
 
 
 # ── Progress bar ─────────────────────────────────────────────────────────────
@@ -152,7 +196,7 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
         return
     pct  = current / total
     done = int(bar_width * pct)
-    bar  = "\u2588" * done + "\u2591" * (bar_width - done)  # █ dan ░
+    bar  = "\u2588" * done + "\u2591" * (bar_width - done)  # █ and ░
     bar_str   = c_cyan(bar) if _COLOR_ENABLED else bar
     label_str = (label[:22] + "\u2026") if len(label) > 23 else label.ljust(23)
     gray_label = c_gray(label_str) if _COLOR_ENABLED else label_str
@@ -165,7 +209,10 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
 
 def ask(prompt, default=None):
     suffix = f" [{default}]" if default else ""
-    value = input(f"{prompt}{suffix}: ").strip()
+    try:
+        value = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raise KeyboardInterrupt
     return value or default
 
 
@@ -238,11 +285,12 @@ def choose_server_dir():
     """Choose a Bedrock server folder through an interactive menu."""
     current = Path.cwd().resolve()
     while True:
-        print(f"\n{c_bold('Currently in :')} [{current}]")
-        print(f"  1) Use this folder as the server directory ({current.name})")
-        print("  2) List all folders here")
-        print("  3) Enter a manual path")
-        choice = ask("Choose an option", "1")
+        print(f"\n{c_bold('Server location')}")
+        ui_hint(f"Current folder: {current}")
+        ui_option("1", "Use current folder", f"{current.name}/")
+        ui_option("2", "Browse subfolders")
+        ui_option("3", "Enter manual path")
+        choice = ask("Choose option", "1")
 
         try:
             if choice == "1":
@@ -250,35 +298,36 @@ def choose_server_dir():
             elif choice == "2":
                 folders = sorted([p for p in current.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
                 if not folders:
-                    print("No folders in this directory.")
+                    ui_empty("No folders found.", "Enter a manual Bedrock server path instead.")
                     continue
-                print("\nAvailable folders:")
+                print(f"\n{c_bold('Available folders')}")
                 for idx, folder in enumerate(folders, 1):
-                    print(f"  {idx}) {folder.name}")
+                    ui_option(str(idx), folder.name)
                 raw = ask("Choose folder number")
                 try:
                     index = int(raw)
                 except (TypeError, ValueError):
-                    print("Choice must be a number.")
+                    print(c_warn("Choice must be a number."))
                     continue
                 if index < 1 or index > len(folders):
-                    print("Invalid folder choice.")
+                    print(c_warn("Invalid folder choice."))
                     continue
                 server_dir = folders[index - 1]
             elif choice == "3":
                 manual = ask("Bedrock server folder path", str(current))
                 server_dir = Path(manual).expanduser().resolve()
             else:
-                print("Choice must be 1, 2, or 3.")
+                print(c_warn("Choose 1, 2, or 3."))
                 continue
 
             if not server_dir.exists():
-                print(f"Server folder does not exist: {server_dir}")
+                print(c_warn(f"Server folder does not exist: {server_dir}"))
                 continue
             validate_server_dir(server_dir)
             return server_dir
         except RuntimeError as e:
             print(c_err(f"Error: {e}") if _COLOR_ENABLED else f"Error: {e}")
+            ui_hint("Expected files: server.properties and bedrock_server(.exe). Use option 3 if the server is elsewhere.")
 
 
 def validate_uuid(uuid, context=""):
@@ -422,7 +471,7 @@ def write_text(path, content):
     if not DRY_RUN:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        log.debug("Tulis file: %s (%d bytes)", path, len(content.encode()))
+        log.debug("Write file: %s (%d bytes)", path, len(content.encode()))
 
 
 def load_json(path):
@@ -499,7 +548,7 @@ def process_nested_archives(directory: Path, max_depth: int = 10) -> None:
     failed: set[Path] = set()  # Track failed archives so they are not retried
     while found_any:
         if nested_count >= max_depth:
-            log.warning("Batas kedalaman nested archive tercapai (%d). Stop.", max_depth)
+            log.warning("Nested archive depth limit reached (%d). Stop.", max_depth)
             break
         found_any = False
         log.info("Scan nested archives: %s", directory)
@@ -520,7 +569,7 @@ def process_nested_archives(directory: Path, max_depth: int = 10) -> None:
                     log.warning("Failed to extract nested archive %s: %s", path.name, e)
                     failed.add(path)
     if nested_count > 0:
-        print(f"         {c_ok(f'{nested_count} sub-pack diekstrak')}")
+        print(f"         {c_ok(f'{nested_count} sub-pack extracted')}")
 
 
 def temp_extract_dir(archive: Path) -> Path:
@@ -571,37 +620,38 @@ def choose_archive_location(server_dir):
     cwd = Path.cwd().resolve()
 
     while True:
-        print(f"\n{c_bold('Addon/template location')}")
-        print(f"  1) List folders in {cwd.name}/")
-        print(f"  2) Scan server folder ({server_dir.name}/)")
-        print("  3) Enter a manual path folder/file")
-        choice = ask("Choose an option", "1")
+        print(f"\n{c_bold('Addon source')}")
+        ui_hint(f"Supported: {', '.join(sorted(PACK_EXTS))}, tar archives")
+        ui_option("1", "Browse local folders", f"inside {cwd.name}/")
+        ui_option("2", "Scan server folder", f"{server_dir.name}/")
+        ui_option("3", "Enter manual folder/file path")
+        choice = ask("Choose option", "1")
 
         if choice == "1":
             folders = sorted([p for p in cwd.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
             # Hide internal folders
             folders = [f for f in folders if not f.name.startswith((".") ) and f.name != "__pycache__"]
             if not folders:
-                print("No folders in this directory.")
+                ui_empty("No folders found.", "Use a manual folder/file path instead.")
                 continue
-            print(f"\nFolders in {cwd.name}/:")
+            print(f"\n{c_bold(f'Folders in {cwd.name}/')}")
             for idx, folder in enumerate(folders, 1):
                 count = sum(1 for _ in folder.rglob("*") if _.is_file() and is_pack_file(_))
-                count_str = c_gray(f"({count} file)") if count > 0 else c_gray("(empty)")
-                print(f"  {idx}) {folder.name}/ {count_str}")
+                detail = f"{plural(count, 'archive')}" if count > 0 else "no supported archives"
+                ui_option(str(idx), f"{folder.name}/", detail)
             raw = ask("Choose folder number")
             try:
                 index = int(raw)
             except (TypeError, ValueError):
-                print("Choice must be a number.")
+                print(c_warn("Choice must be a number."))
                 continue
             if index < 1 or index > len(folders):
-                print("Invalid folder choice.")
+                print(c_warn("Invalid folder choice."))
                 continue
             picked = folders[index - 1]
             pick_count = sum(1 for _ in picked.rglob("*") if _.is_file() and is_pack_file(_))
             if pick_count == 0:
-                print(c_warn(f"Folder {picked.name}/ has no addon files. Choose another folder."))
+                ui_empty(f"No addon archives found in {picked.name}/.", "Choose another folder or enter a manual file path.")
                 continue
             return picked
 
@@ -614,11 +664,11 @@ def choose_archive_location(server_dir):
                 continue
             path = Path(manual).expanduser().resolve()
             if not path.exists():
-                print(f"Path does not exist: {path}")
+                print(c_warn(f"Path does not exist: {path}"))
                 continue
             return path
 
-        print("Choose 1, 2, or 3.")
+        print(c_warn("Choose 1, 2, or 3."))
 
 
 def get_key():
@@ -669,15 +719,16 @@ def render_checkbox_picker(candidates, selected, cursor, search_dirs):
     """Render the interactive addon picker."""
     print("\033[2J\033[H", end="")
     scan_names = ", ".join(d.name for d in search_dirs if d.exists())
-    print(f"Addon/template found: {c_gray(f'({len(candidates)} file)')}")
-    print(f"{c_gray(f'Scan: {scan_names}')}")
+    print(c_divider("Select addons"))
+    ui_hint(f"Found {plural(len(candidates), 'archive')} \u00b7 Scan: {scan_names}")
     for i, path in enumerate(candidates):
-        pointer = ">" if i == cursor else " "
-        mark = "x" if i in selected else " "
+        pointer = c_cyan("\u203a") if i == cursor else " "
+        mark = c_green("\u2713") if i in selected else " "
         folder = c_gray(f'({path.parent.name}/)')
         print(f"  {pointer} [{mark}] {i + 1}. {path.name} {folder}")
-    print("\n\u2191/\u2193 choose addon, Space toggle, Enter install selected items")
-    print("a select all, c clear, r refresh, m manual input, q cancel")
+    print()
+    ui_hint("\u2191/\u2193 move \u00b7 Space select \u00b7 Enter install")
+    ui_hint("a all \u00b7 c clear \u00b7 r refresh \u00b7 m manual file \u00b7 q cancel")
 
 
 def choose_archives_keyboard(candidates, search_dirs):
@@ -720,11 +771,11 @@ def choose_archives_keyboard(candidates, search_dirs):
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(f"File does not exist: {manual_path}")
+                    print(c_warn(f"File does not exist: {manual_path}"))
                     input("Press Enter to continue...")
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(f"File is not a Bedrock addon/template/archive: {manual_path}")
+                    print(c_warn(f"File is not a Bedrock addon/template/archive: {manual_path}"))
                     input("Press Enter to continue...")
                     continue
                 candidates.append(manual_path)
@@ -736,20 +787,18 @@ def choose_archives_keyboard(candidates, search_dirs):
 
 
 def choose_archives_text(candidates, search_dirs):
-    """Fallback picker addon berbasis input teks."""
+    """Text-based addon picker fallback."""
     selected = set()
     while True:
-        print(f"\nAddon/template found: ({len(candidates)} file)")
+        print(c_divider("Select addons"))
+        ui_hint(f"Found {plural(len(candidates), 'archive')}")
         for i, path in enumerate(candidates, 1):
-            mark = "x" if i in selected else " "
-            folder = f'({path.parent.name}/)'
+            mark = c_green("✓") if i in selected else " "
+            folder = c_gray(f'({path.parent.name}/)')
             print(f"  [{mark}] {i}. {path.name} {folder}")
-        print("\nType numbers to toggle selection. Example: 1 or 1,3")
-        print("  a. Select all")
-        print("  c. Clear selection")
-        print("  r. Refresh (rescan folders)")
-        print("  0. Enter manual file path")
-        print("  empty. Install selected items")
+        print()
+        ui_hint("Numbers toggle selection, example: 1 or 1,3")
+        ui_hint("a all · c clear · r refresh · 0 manual file · empty install")
 
         choice = ask("Choose addon/template", "")
         if choice == "":
@@ -768,17 +817,17 @@ def choose_archives_text(candidates, search_dirs):
             for i, path in enumerate(candidates, 1):
                 if path in old_selected_paths:
                     selected.add(i)
-            print(f"Refreshed! {len(candidates)} file(s) found.")
+            print(c_ok(f"Refreshed: {plural(len(candidates), 'archive')} found."))
             continue
         if choice == "0":
             manual = ask("File path")
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(f"File does not exist: {manual_path}")
+                    print(c_warn(f"File does not exist: {manual_path}"))
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(f"File is not a Bedrock addon/template/archive: {manual_path}")
+                    print(c_warn(f"File is not a Bedrock addon/template/archive: {manual_path}"))
                     continue
                 candidates.append(manual_path)
                 selected.add(len(candidates))
@@ -798,7 +847,7 @@ def choose_archives_text(candidates, search_dirs):
             else:
                 selected.add(index)
         if not ok:
-            print("Invalid choice. Use numbers, example: 1 or 1,3")
+            print(c_warn("Invalid choice. Use numbers, example: 1 or 1,3."))
 
     return [candidates[i - 1] for i in sorted(selected)]
 
@@ -808,7 +857,7 @@ def choose_archives(server_dir):
         source = choose_archive_location(server_dir)
         if source.is_file():
             if not is_pack_file(source):
-                print(f"File is not a Bedrock addon/template/archive: {source}")
+                print(c_warn(f"File is not a Bedrock addon/template/archive: {source}"))
                 continue
             return [source]
 
@@ -816,8 +865,7 @@ def choose_archives(server_dir):
         candidates = list_archives(search_dirs)
         if candidates:
             break
-        print(f"\nNo .mcpack/.mcaddon/.mctemplate/.zip/.tar.gz files in: {source.name}/")
-        print("Choose another location.")
+        ui_empty(f"No supported addon archives found in {source.name}/.", "Choose another location or enter a manual file path.")
 
     if sys.stdin.isatty():
         return choose_archives_keyboard(candidates, search_dirs)
@@ -1043,24 +1091,27 @@ def set_texturepack_required(server_dir):
     write_text(props, "\n".join(new_lines) + "\n")
 
 
+def print_world_choices(title, worlds):
+    print(f"\n{c_bold(title)}")
+    for i, world in enumerate(worlds, 1):
+        ui_option(str(i), world.name)
+
+
 def choose_world(server_dir, imported_worlds):
     if imported_worlds:
-        print("\nImported worlds:")
-        for i, w in enumerate(imported_worlds, 1):
-            print(f"  {i}. {w.name}")
-        if yes_no("Use this imported world to enable packs?", True):
+        print_world_choices("Imported worlds", imported_worlds)
+        if yes_no("Use an imported world to enable packs?", True):
             if len(imported_worlds) == 1:
                 return imported_worlds[0]
-            # Handle non-integer input without crashing
             while True:
                 raw = ask("Choose imported world", "1")
                 try:
                     idx = int(raw)
                     if 1 <= idx <= len(imported_worlds):
                         return imported_worlds[idx - 1]
-                    print(f"Choose a number 1-{len(imported_worlds)}.")
+                    print(c_warn(f"Choose a number 1-{len(imported_worlds)}."))
                 except ValueError:
-                    print("Enter a valid number.")
+                    print(c_warn("Enter a valid number."))
 
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
@@ -1070,11 +1121,8 @@ def choose_world(server_dir, imported_worlds):
     existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
 
     if existing:
-        print("\nWorld folders found:")
-        for i, w in enumerate(existing, 1):
-            print(f"  {i}. {w.name}")
-        print("  0. Create/use another name")
-        # Handle non-integer input without crashing
+        print_world_choices("World folders", existing)
+        ui_option("0", "Create/use another name")
         while True:
             choice = ask("Choose world", "1")
             try:
@@ -1083,15 +1131,14 @@ def choose_world(server_dir, imported_worlds):
                     break
                 if 1 <= idx <= len(existing):
                     return existing[idx - 1]
-                print(f"Choose a number 0-{len(existing)}.")
+                print(c_warn(f"Choose a number 0-{len(existing)}."))
             except ValueError:
-                print("Enter a valid number.")
+                print(c_warn("Enter a valid number."))
 
     prop_name = read_server_level_name(server_dir)
     default_name = prop_name or "Bedrock level"
 
-    print(c_warn("No world folder exists in this server yet."))
-    print(f"Default name from server.properties: {c_bold(default_name)}")
+    ui_empty("No world folders found.", f"Default name from server.properties: {default_name}")
 
     if yes_no(f"Create world named \"{default_name}\"?", True):
         world_name = safe_world_name(default_name)
@@ -1124,54 +1171,41 @@ def _tick(cond: bool) -> str:
 
 
 def print_summary(archive_results, dep_missing) -> None:
-    """Cetak summary terpisah per addon/archive."""
+    """Print a clean per-archive install summary."""
     for archive_name, packs, worlds in archive_results:
-        print(f"\n{c_bold('== Summary ==')} {c_cyan(archive_name)}")
+        print(c_divider(f"Summary · {archive_name}"))
 
-        # Show processed addon name and UUID
         seen = set()
         for p in packs:
             pid = p["pack_id"]
             if pid not in seen:
                 seen.add(pid)
-                print(f"{c_ok(p['name'])} {c_gray('(' + pid + ')')}")
+                print(f"  {c_ok(p['name'])} {c_gray(pid)}")
 
-        # Show Dry-run only when enabled (DRY_RUN = True)
         if DRY_RUN:
-            print("Dry-run      : Yes")
+            print(f"  {c_yellow('Mode')}       dry-run preview")
 
-        # BP Installed
         bp_packs = [x for x in packs if x["kind"] == "bp"]
-        has_bp = len(bp_packs) > 0
-        print(f"BP installed : {_tick(has_bp)}")
-        if has_bp:
-            for p in bp_packs:
-                print(f"  location   : {p['path']}")
-                print(f"  version    : {'.'.join(map(str, p['version']))}")
-
-        # RP Installed
         rp_packs = [x for x in packs if x["kind"] == "rp"]
-        has_rp = len(rp_packs) > 0
-        print(f"RP installed : {_tick(has_rp)}")
-        if has_rp:
-            for p in rp_packs:
-                print(f"  location   : {p['path']}")
-                print(f"  version    : {'.'.join(map(str, p['version']))}")
+        print(f"  BP packs   {_tick(bool(bp_packs))} {plural(len(bp_packs), 'pack')}")
+        for p in bp_packs:
+            print(f"    {c_gray('path')}    {p['path']}")
+            print(f"    {c_gray('version')} {'.'.join(map(str, p['version']))}")
 
-        # World Import
-        print(f"World import : {_tick(bool(worlds))}")
+        print(f"  RP packs   {_tick(bool(rp_packs))} {plural(len(rp_packs), 'pack')}")
+        for p in rp_packs:
+            print(f"    {c_gray('path')}    {p['path']}")
+            print(f"    {c_gray('version')} {'.'.join(map(str, p['version']))}")
+
+        print(f"  Worlds     {_tick(bool(worlds))} {plural(len(worlds), 'import')}")
         for w in worlds:
-            print(f"  location   : {w}")
+            print(f"    {c_gray('path')}    {w}")
 
-        # Missing Deps per addon
         pack_ids = {p["pack_id"] for p in packs}
         local_missing = [(p, d) for p, d in dep_missing if p["pack_id"] in pack_ids]
-        if local_missing:
-            print(f"Missing deps : {len(local_missing)} item")
-            for pack, dep in local_missing:
-                print(f"  {c_err(pack['name'])} needs {c_yellow(dep['uuid'])} version {dep.get('version')}")
-        else:
-            print("Missing deps : Nothing")
+        print(f"  Deps       {_tick(not local_missing)} {plural(len(local_missing), 'missing dependency')}")
+        for pack, dep in local_missing:
+            print(f"    {c_err(pack['name'])} needs {c_yellow(dep['uuid'])} version {dep.get('version')}")
 
 
 # Built-in Minecraft folder prefixes/patterns that must not be deleted
@@ -1222,14 +1256,16 @@ def get_installed_addons(server_dir):
 
 def render_checkbox_picker_addons(candidates, selected, cursor):
     print("\033[2J\033[H", end="")
-    print("Installed addons found:")
+    print(c_divider("Select addons to delete"))
+    ui_hint(f"Found {plural(len(candidates), 'installed addon')}")
     for i, p in enumerate(candidates):
-        pointer = ">" if i == cursor else " "
-        mark = "x" if i in selected else " "
+        pointer = c_cyan("›") if i == cursor else " "
+        mark = c_green("✓") if i in selected else " "
         kind_str = "RP" if p["kind"] == "rp" else "BP"
-        print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} ({p['path'].name})")
-    print("\n↑/↓ choose addon, Space toggle, Enter delete selected items")
-    print("a select all, c clear, q cancel")
+        print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} {c_gray('(' + p['path'].name + ')')}")
+    print()
+    ui_hint("↑/↓ move · Space select · Enter delete")
+    ui_hint("a all · c clear · q cancel")
 
 def choose_addons_keyboard(candidates):
     if not candidates:
@@ -1262,13 +1298,16 @@ def choose_addons_keyboard(candidates):
 def choose_addons_text(candidates):
     selected = set()
     while True:
-        print("\nInstalled addons:")
+        print(c_divider("Select addons to delete"))
+        ui_hint(f"Found {plural(len(candidates), 'installed addon')}")
         for i, p in enumerate(candidates, 1):
-            mark = "x" if i in selected else " "
+            mark = c_green("✓") if i in selected else " "
             kind_str = "RP" if p["kind"] == "rp" else "BP"
-            print(f"  [{mark}] {i}. [{kind_str}] {p['name']} ({p['path'].name})")
-        print("\nType numbers to toggle selection (example: 1 or 1,3). a=all, c=clear, empty=Continue")
-        
+            print(f"  [{mark}] {i}. [{kind_str}] {p['name']} {c_gray('(' + p['path'].name + ')')}")
+        print()
+        ui_hint("Numbers toggle selection, example: 1 or 1,3")
+        ui_hint("a all · c clear · empty continue")
+
         choice = ask("Choose addon to delete", "")
         if choice == "":
             break
@@ -1293,7 +1332,7 @@ def choose_addons_text(candidates):
             else:
                 selected.add(index)
         if not ok:
-            print("Invalid choice.")
+            print(c_warn("Invalid choice."))
     
     return [candidates[i - 1] for i in sorted(selected)]
 
@@ -1317,9 +1356,11 @@ def disable_pack_in_world(world_dir, pack):
     return False
 
 def uninstall_addon_flow(server_dir):
+    if not DRY_RUN:
+        ui_hint("Tip: run with --dry-run first to preview uninstall changes.")
     candidates = get_installed_addons(server_dir)
     if not candidates:
-        print(c_warn("No installed addons found."))
+        ui_empty("No installed addons found.", "Only user-installed packs with manifest.json are shown.")
         return
     
     if sys.stdin.isatty():
@@ -1328,7 +1369,7 @@ def uninstall_addon_flow(server_dir):
         to_remove = choose_addons_text(candidates)
         
     if not to_remove:
-        print("Cancelled, nothing was deleted.")
+        print(c_warn("Cancelled, nothing was deleted."))
         return
     
     # Confirmation before deletion - strong warning
@@ -1352,7 +1393,7 @@ def uninstall_addon_flow(server_dir):
     total = len(to_remove)
     removed_names = []
     
-    print(c_divider(f"Deleting {total} addon"))
+    print(c_divider(f"Deleting {plural(total, 'addon')}"))
     for idx, pack in enumerate(to_remove, 1):
         pack_path = pack["path"]
         kind_label = "RP" if pack["kind"] == "rp" else "BP"
@@ -1377,9 +1418,9 @@ def uninstall_addon_flow(server_dir):
         
         removed_names.append(f"[{kind_label}] {pack['name']}")
     
-    # Summary akhir
-    print(c_divider("Uninstall Complete"))
-    print(f"  Total deleted: {c_green(str(total))} addon")
+    # Final summary
+    print(c_divider("Uninstall complete"))
+    print(f"  Deleted    {c_green(plural(total, 'addon'))}")
     for name in removed_names:
         print(f"  {c_ok(name)}")
     print(c_divider())
@@ -1410,10 +1451,7 @@ def main():
     if DRY_RUN:
         log.info("DRY-RUN mode enabled")
 
-    print(c_divider("⛏  Bedrock Addon Installer by @zoxervy"))
-    print(c_gray(f"Log: {log_file.resolve()}"))
-    if DRY_RUN:
-        print(c_yellow("Mode: DRY-RUN enabled, no files will be written."))
+    ui_banner(log_file)
 
     # Step 1: Choose server
     print(c_divider("Step 1: Choose Server"))
@@ -1422,18 +1460,21 @@ def main():
 
     # Step 2: Choose action
     print(c_divider("Step 2: Choose Action"))
-    print("  1) \U0001F4E5 Install Addon")
-    print("  2) \U0001F5D1  Uninstall Addon")
+    ui_option("1", "📥 Install addon", "copy packs and enable them in a world")
+    ui_option("2", "🗑  Uninstall addon", "remove user-installed packs")
     while True:
         action_choice = ask("Choose action", "1")
         if action_choice in ("1", "2"):
             break
-        print("Choose 1 or 2.")
+        print(c_warn("Choose 1 or 2."))
 
     if action_choice == "2":
         print(c_divider("Uninstall Addon"))
         uninstall_addon_flow(server_dir)
         return
+
+    if not DRY_RUN:
+        ui_hint("Tip: run with --dry-run first when installing unknown addons.")
 
     # Step 3: Choose addons
     print(c_divider("Step 3: Choose Addons"))
@@ -1441,7 +1482,7 @@ def main():
     if not archives:
         print(c_warn("No files selected."))
         return
-    print(f"{c_ok(f'{len(archives)} addon(s) selected')}")
+    print(c_ok(f"{plural(len(archives), 'addon')} selected"))
 
     installed = []
     imported_worlds = []
@@ -1449,7 +1490,7 @@ def main():
     total_archives = len(archives)
 
     # Step 4: Process install
-    print(c_divider(f"Step 4: Install ({total_archives} addon)"))
+    print(c_divider(f"Step 4: Install ({plural(total_archives, 'addon')})"))
     for idx, archive in enumerate(archives, 1):
         size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
         print(f"\n  [{idx}/{total_archives}] {c_bold(archive.name)} {c_gray(f'({size_str})')}")
@@ -1464,6 +1505,7 @@ def main():
 
     # Step 5: Choose target world
     print(c_divider("Step 5: Choose World"))
+    ui_hint("Packs are installed. Choose a world to enable them in world JSON files.")
     world_dir = choose_world(server_dir, imported_worlds)
     print(f"{c_ok(f'World: {world_dir.name}')}")
 
