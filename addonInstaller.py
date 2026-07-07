@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 import tarfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
-PACK_EXTS = {".mcpack", ".mcaddon", ".mctemplate", ".zip"}
-TAR_EXTS  = {".tar.gz", ".tgz", ".tar.bz2"}      # supported tar formats
-WORLD_MARKERS = {"level.dat", "levelname.txt"}
-DRY_RUN = False
-MAX_ARCHIVE_MB = 500
-UUID_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-    re.IGNORECASE
+from addon_installer.constants import MAX_ARCHIVE_MB, PACK_EXTS, TAR_EXTS, WORLD_MARKERS
+from addon_installer.manifest_utils import (
+    archive_stem_from_manifest,
+    check_dependencies,
+    detect_pack_kinds,
+    language_files_for_pack,
+    load_json,
+    manifest_dependencies,
+    manifest_display_name,
+    pack_folder_name,
+    read_lang_entries,
+    resolve_pack_text,
+    validate_uuid,
+    version_array,
 )
+from addon_installer.path_utils import clean_name, is_within_dir, safe_child_path, safe_world_name
+
+DRY_RUN = False
 
 
 def is_tar_file(path: Path) -> bool:
@@ -32,47 +42,24 @@ def is_pack_file(path: Path) -> bool:
     """Check whether path is a supported pack/archive file."""
     return path.suffix.lower() in PACK_EXTS or is_tar_file(path)
 
-def is_within_dir(base: Path, target: Path) -> bool:
-    """Check that target stays inside base after resolving paths."""
-    try:
-        return os.path.commonpath([str(base.resolve()), str(target.resolve())]) == str(base.resolve())
-    except ValueError:
-        return False
-
-
-def safe_child_path(base: Path, name: str, label: str) -> Path:
-    """Build a child path that cannot escape base."""
-    target = base / name
-    if not is_within_dir(base, target):
-        raise RuntimeError(f"Path traversal blocked: {label}")
-    return target
-
-
-def safe_world_name(name: str) -> str:
-    """Validate world names so they cannot become path traversal."""
-    cleaned = name.strip()
-    if not cleaned:
-        raise RuntimeError("World name cannot be empty.")
-    if Path(cleaned).is_absolute() or Path(cleaned).name != cleaned:
-        raise RuntimeError(f"Unsafe world name: {name}")
-    if cleaned in {".", ".."}:
-        raise RuntimeError(f"Unsafe world name: {name}")
-    return cleaned
-
-
 # ── Logging setup ────────────────────────────────────────────────────────────
 log = logging.getLogger("bedrock_addon")
 
 
-def setup_logging():
+def setup_logging(dry_run: bool = False) -> Optional[Path]:
     """Initialize logging to file and stderr."""
     log.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    log_file = None if DRY_RUN else Path("addonInstaller.log")
+    log_file = Path("addonInstaller.log")
+    log_file_resolved = log_file.resolve()
 
-    if log_file is not None:
-        log_file_resolved = log_file.resolve()
+    if dry_run:
+        for handler in list(log.handlers):
+            if isinstance(handler, logging.FileHandler):
+                log.removeHandler(handler)
+                handler.close()
+    else:
         has_file_handler = any(
             isinstance(handler, logging.FileHandler)
             and Path(handler.baseFilename).resolve() == log_file_resolved
@@ -99,7 +86,7 @@ def setup_logging():
     log.info("=" * 60)
     log.info("Bedrock Addon Setup started")
     log.info("Platform: %s | Python: %s", sys.platform, sys.version.split()[0])
-    return log_file
+    return None if dry_run else log_file
 
 
 # ── Color utilities ──────────────────────────────────────────────────────────
@@ -142,51 +129,60 @@ def c_warn(t: str)   -> str: return c_yellow(f"\u26a0 {t}")
 def c_err(t: str)    -> str: return c_red(f"\u2717 {t}")
 def c_info(t: str)   -> str: return c_cyan(f"\u2192 {t}")
 def c_divider(t: str = "") -> str:
-    line = "\u2500" * 58
+    line = "\u2500" * 72
     return c_gray(f"\n{line}") if not t else f"\n{c_bold(t)}\n{c_gray(line)}"
 
+def ui_step(number: int, title: str, note: str = "") -> None:
+    """Print a consistent step header."""
+    print(c_divider(f"Step {number}: {title}"))
+    if note:
+        print(c_gray(f"  {note}"))
 
-def ui_banner(log_file) -> None:
-    """Print the app banner and current runtime mode."""
-    width = 58
-    title = "Bedrock Addon Installer"
-    subtitle = "Install, enable, and remove Minecraft Bedrock addons"
-    print()
-    print(c_cyan("\u2554" + "\u2550" * width + "\u2557"))
-    print(c_cyan("\u2551") + c_bold(f" {title}".ljust(width)) + c_cyan("\u2551"))
-    print(c_cyan("\u2551") + c_gray(f" {subtitle}".ljust(width)) + c_cyan("\u2551"))
-    print(c_cyan("\u255a" + "\u2550" * width + "\u255d"))
-    print(f"  {c_gray('Author')}  @zoxervy")
-    if log_file is not None:
-        print(f"  {c_gray('Log')}     {log_file.resolve()}")
+def ui_kv(label: str, value) -> None:
+    """Print aligned key/value rows for readable metadata."""
+    print(f"  {c_gray((label + ':').ljust(15))} {value}")
+
+def ui_option(number: str, label: str, hint: str = "") -> None:
+    """Print a numbered menu option."""
+    suffix = f" {c_gray(hint)}" if hint else ""
+    print(f"  {c_cyan(number.rjust(2))}) {label}{suffix}")
+
+def ui_status(kind: str, text: str) -> None:
+    """Print a high-signal status line."""
+    if kind == "ok":
+        print(f"  {c_ok(text)}")
+    elif kind == "warn":
+        print(f"  {c_warn(text)}")
+    elif kind == "err":
+        print(f"  {c_err(text)}")
     else:
-        print(f"  {c_gray('Log')}     disabled in dry-run mode")
+        print(f"  {c_info(text)}")
+
+def plural(count: int, singular: str, plural_word=None) -> str:
+    word = singular if count == 1 else (plural_word or f"{singular}s")
+    return f"{count} {word}"
+
+
+def ui_banner(log_file, force_delete=False) -> None:
+    """Print the app banner and current runtime mode."""
+    width = 72
+    title = "Bedrock Addon Installer"
+    subtitle = "Install, enable, reorder, and remove Minecraft Bedrock addons"
+    print()
+    print(c_cyan("╔" + "═" * width + "╗"))
+    print(c_cyan("║") + c_bold(f" {title}".ljust(width)) + c_cyan("║"))
+    print(c_cyan("║") + c_gray(f" {subtitle}".ljust(width)) + c_cyan("║"))
+    print(c_cyan("╚" + "═" * width + "╝"))
+    ui_kv("Author", "@zoxervy")
+    ui_kv("Safety", "Backups before overwrite · safe archive extraction")
+    if log_file:
+        ui_kv("Log", log_file.resolve())
+    else:
+        ui_kv("Log", "disabled in dry-run mode")
     if DRY_RUN:
-        print(f"  {c_yellow('Mode')}    DRY-RUN, no files will be written")
-
-
-def ui_option(key: str, label: str, detail: str = "") -> None:
-    """Print a menu option with aligned label and detail."""
-    suffix = f" {c_gray(detail)}" if detail else ""
-    print(f"  {c_cyan(str(key) + ')')} {label}{suffix}")
-
-
-def ui_hint(text: str) -> None:
-    print(f"  {c_gray(text)}")
-
-
-def ui_empty(title: str, detail: str = "") -> None:
-    print(c_warn(title))
-    if detail:
-        ui_hint(detail)
-
-
-def plural(count: int, word: str) -> str:
-    if count == 1:
-        return f"{count} {word}"
-    if word.endswith("y"):
-        return f"{count} {word[:-1]}ies"
-    return f"{count} {word}s"
+        ui_kv("Mode", c_yellow("DRY-RUN (no file writes)"))
+    if force_delete:
+        ui_kv("Uninstall", c_red("force-delete enabled"))
 
 
 # ── Progress bar ─────────────────────────────────────────────────────────────
@@ -196,7 +192,7 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
         return
     pct  = current / total
     done = int(bar_width * pct)
-    bar  = "\u2588" * done + "\u2591" * (bar_width - done)  # █ and ░
+    bar  = "\u2588" * done + "\u2591" * (bar_width - done)  # filled and empty blocks
     bar_str   = c_cyan(bar) if _COLOR_ENABLED else bar
     label_str = (label[:22] + "\u2026") if len(label) > 23 else label.ljust(23)
     gray_label = c_gray(label_str) if _COLOR_ENABLED else label_str
@@ -210,7 +206,7 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
 def ask(prompt, default=None):
     suffix = f" [{default}]" if default else ""
     try:
-        value = input(f"{prompt}{suffix}: ").strip()
+        value = input(f"  {prompt}{suffix}: ").strip()
     except EOFError:
         raise KeyboardInterrupt
     return value or default
@@ -222,7 +218,7 @@ def yes_no(prompt, default=True):
         value = input(f"{prompt} [{d}]: ").strip().lower()
         if not value:
             return default
-        if value in ("y", "yes", "ya", "iya"):
+        if value in ("y", "yes"):
             return True
         if value in ("n", "no"):
             return False
@@ -238,15 +234,45 @@ def action(text: str) -> None:
     log.info(text)
 
 
-def timestamp():
+def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def backup_path(path):
-    return path.with_name(f"{path.name}.bak-{timestamp()}")
+def unique_backup_path(path: Path) -> Path:
+    """Return a backup path that will not overwrite an existing backup."""
+    base = path.with_name(f"{path.name}.bak-{timestamp()}")
+    if not base.exists():
+        return base
+    index = 1
+    while True:
+        candidate = path.with_name(f"{base.name}-{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
-def backup_existing(path):
+def backup_path(path: Path) -> Path:
+    return unique_backup_path(path)
+
+
+def uninstall_backup_path(server_dir: Path, pack_path: Path, kind: str) -> Path:
+    """Build a centralized uninstall backup path grouped by server and pack kind."""
+    backup_root = Path(__file__).resolve().parent / ".temp-addonInstaller" / "backups"
+    server_root = safe_child_path(backup_root, clean_name(server_dir.name), server_dir.name)
+    kind_root = safe_child_path(server_root, kind, kind)
+    backup_name = f"{pack_path.name}.bak-{timestamp()}"
+    backup = safe_child_path(kind_root, backup_name, backup_name)
+    if not backup.exists():
+        return backup
+    index = 1
+    while True:
+        candidate_name = f"{backup_name}-{index}"
+        candidate = safe_child_path(kind_root, candidate_name, candidate_name)
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+def backup_existing(path: Path) -> Optional[Path]:
     if not path.exists():
         return None
     backup = backup_path(path)
@@ -259,7 +285,7 @@ def backup_existing(path):
     return backup
 
 
-def read_server_level_name(server_dir):
+def read_server_level_name(server_dir: Path) -> Optional[str]:
     props = server_dir / "server.properties"
     if not props.exists():
         return None
@@ -280,17 +306,37 @@ def validate_server_dir(server_dir):
     if missing:
         raise RuntimeError(f"This folder is not a valid/complete Bedrock server. Missing: {', '.join(missing)}")
 
+def server_addon_count_hint(server_dir: Path):
+    """Return a short installed-addon hint for folders that look like Bedrock servers."""
+    binary_name = "bedrock_server.exe" if sys.platform == "win32" else "bedrock_server"
+    if not (server_dir / "server.properties").exists() or not (server_dir / binary_name).exists():
+        return ""
+
+    count = 0
+    for folder_name in ("resource_packs", "behavior_packs"):
+        base = server_dir / folder_name
+        if not base.exists():
+            continue
+        for pack_dir in base.iterdir():
+            if (
+                pack_dir.is_dir()
+                and not _is_builtin_pack(pack_dir.name)
+                and (pack_dir / "manifest.json").exists()
+            ):
+                count += 1
+    return f"({plural(count, 'addon')} installed)"
+
 
 def choose_server_dir():
     """Choose a Bedrock server folder through an interactive menu."""
     current = Path.cwd().resolve()
     while True:
-        print(f"\n{c_bold('Server location')}")
-        ui_hint(f"Current folder: {current}")
+        print(c_divider("Server folder"))
+        ui_kv("Current", current)
         ui_option("1", "Use current folder", f"{current.name}/")
-        ui_option("2", "Browse subfolders")
-        ui_option("3", "Enter manual path")
-        choice = ask("Choose option", "1")
+        ui_option("2", "Browse folders here")
+        ui_option("3", "Enter custom path")
+        choice = ask("Select option", "1")
 
         try:
             if choice == "1":
@@ -298,43 +344,37 @@ def choose_server_dir():
             elif choice == "2":
                 folders = sorted([p for p in current.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
                 if not folders:
-                    ui_empty("No folders found.", "Enter a manual Bedrock server path instead.")
+                    ui_status("warn", "No folders in this directory.")
                     continue
-                print(f"\n{c_bold('Available folders')}")
+                print(c_divider("Available folders"))
                 for idx, folder in enumerate(folders, 1):
-                    ui_option(str(idx), folder.name)
-                raw = ask("Choose folder number")
+                    ui_option(str(idx), folder.name, server_addon_count_hint(folder))
+                raw = ask("Select folder")
                 try:
                     index = int(raw)
                 except (TypeError, ValueError):
-                    print(c_warn("Choice must be a number."))
+                    ui_status("warn", "Choice must be a number.")
                     continue
                 if index < 1 or index > len(folders):
-                    print(c_warn("Invalid folder choice."))
+                    ui_status("warn", "Invalid folder choice.")
                     continue
                 server_dir = folders[index - 1]
             elif choice == "3":
                 manual = ask("Bedrock server folder path", str(current))
                 server_dir = Path(manual).expanduser().resolve()
             else:
-                print(c_warn("Choose 1, 2, or 3."))
+                ui_status("warn", "Choice must be 1, 2, or 3.")
                 continue
 
             if not server_dir.exists():
-                print(c_warn(f"Server folder does not exist: {server_dir}"))
+                ui_status("err", f"Server folder does not exist: {server_dir}")
                 continue
             validate_server_dir(server_dir)
             return server_dir
         except RuntimeError as e:
-            print(c_err(f"Error: {e}") if _COLOR_ENABLED else f"Error: {e}")
-            ui_hint("Expected files: server.properties and bedrock_server(.exe). Use option 3 if the server is elsewhere.")
-
-
-def validate_uuid(uuid, context=""):
-    """Validate standard UUID format (8-4-4-4-12 hex)."""
-    label = f" in {context}" if context else ""
-    if not uuid or not UUID_RE.match(uuid):
-        raise RuntimeError(f"Invalid UUID{label}: {uuid!r}")
+            ui_status("err", f"Error: {e}")
+            ui_kv("Expected", "server.properties and bedrock_server(.exe)")
+            ui_kv("Tip", "Use option 3 if the server is elsewhere.")
 
 
 def validate_archive(archive: Path) -> None:
@@ -433,11 +473,12 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
 
 
 
-def safe_copytree(src: Path, dest: Path) -> None:
+def safe_copytree(src: Path, dest: Path):
     """Copy src directory to dest with backup, disk check, and progress bar."""
+    backup = None
     if dest.exists():
         if yes_no(f"Folder {dest.name} already exists. Replace?", True):
-            backup_existing(dest)
+            backup = backup_existing(dest)
             log.info("Remove: %s", dest)
             if not DRY_RUN:
                 shutil.rmtree(dest)
@@ -462,57 +503,87 @@ def safe_copytree(src: Path, dest: Path) -> None:
         if total == 0:
             pass  # empty directory, no progress to show
         log.info("Copy complete: %s \u2192 %s (%d files)", src, dest, total)
+    return backup
 
 
 def write_text(path, content):
+    backup = None
     if path.exists():
-        backup_existing(path)
+        backup = backup_existing(path)
     log.info("Write: %s", path)
     if not DRY_RUN:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         log.debug("Write file: %s (%d bytes)", path, len(content.encode()))
+    return backup
 
 
-def load_json(path):
-    # utf-8-sig handles BOM that sometimes appears in Windows files
-    return json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
+def rollback_path(path: Path, backup=None) -> None:
+    """Remove a newly written path and restore its previous backup if one exists."""
+    if DRY_RUN:
+        return
+    if path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    if backup and Path(backup).exists():
+        shutil.move(str(backup), str(path))
 
+def rollback_install(installed, imported_worlds, config_changes) -> None:
+    """Best-effort rollback for a cancelled or failed install transaction."""
+    if DRY_RUN:
+        return
+    ui_status("warn", "Rolling back install changes.")
+    for path, backup in reversed(config_changes):
+        try:
+            rollback_path(Path(path), Path(backup) if backup else None)
+            ui_status("ok", f"Rolled back config: {path}")
+        except Exception as e:
+            ui_status("err", f"Rollback failed for config {path}: {e}")
+            log.warning("Rollback failed for config %s: %s", path, e)
+    for world in reversed(imported_worlds):
+        path = Path(world["path"])
+        backup = Path(world["backup"]) if world.get("backup") else None
+        try:
+            rollback_path(path, backup)
+            ui_status("ok", f"Rolled back world: {path}")
+        except Exception as e:
+            ui_status("err", f"Rollback failed for world {path}: {e}")
+            log.warning("Rollback failed for world %s: %s", path, e)
+    for pack in reversed(installed):
+        path = Path(pack["path"])
+        backup = Path(pack["backup"]) if pack.get("backup") else None
+        try:
+            rollback_path(path, backup)
+            ui_status("ok", f"Rolled back pack: {path}")
+            replaced_path = Path(pack["replaced_path"]) if pack.get("replaced_path") else None
+            replaced_backup = Path(pack["replaced_backup"]) if pack.get("replaced_backup") else None
+            if replaced_path and replaced_backup:
+                rollback_path(replaced_path, replaced_backup)
+                ui_status("ok", f"Restored replaced pack: {replaced_path}")
+        except Exception as e:
+            ui_status("err", f"Rollback failed for pack {path}: {e}")
+            log.warning("Rollback failed for pack %s: %s", path, e)
 
-def version_array(version):
-    if isinstance(version, list):
-        result = version
-    elif isinstance(version, str):
-        result = [int(x) for x in version.split(".")]
-    else:
-        raise RuntimeError(f"Unknown version format: {version}")
-    if not all(isinstance(x, int) for x in result):
-        raise RuntimeError(f"Version must be numeric: {version}")
-    # Pad or truncate to exactly 3 elements to tolerate non-standard manifests
-    result = (result + [0, 0, 0])[:3]
-    return result
-
-
-def detect_pack_kinds(manifest):
-    types = [m.get("type") for m in manifest.get("modules", [])]
-    kinds = []
-    if "resources" in types:
-        kinds.append("rp")
-    if "data" in types or "script" in types:
-        kinds.append("bp")
-    return kinds
-
-
-def clean_name(name):
-    cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in name).strip()
-    return cleaned.replace(" ", "_") or "pack"
-
-
-def pack_folder_name(pack_dir, manifest):
-    header = manifest.get("header", {})
-    name = header.get("name") or pack_dir.name
-    uuid = header.get("uuid", "")[:8]
-    return f"{clean_name(name)}_{uuid}" if uuid else clean_name(name)
+def find_installed_pack_path(server_dir: Path, pack_id: str, kind: str):
+    """Find an existing installed pack folder by UUID and kind."""
+    base = server_dir / ("resource_packs" if kind == "rp" else "behavior_packs")
+    if not base.exists():
+        return None
+    for pack_dir in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+        if not pack_dir.is_dir() or _is_builtin_pack(pack_dir.name):
+            continue
+        manifest_path = pack_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = load_json(manifest_path)
+        except Exception:
+            continue
+        if manifest.get("header", {}).get("uuid") == pack_id:
+            return pack_dir
+    return None
 
 
 def find_manifests(root):
@@ -569,11 +640,13 @@ def process_nested_archives(directory: Path, max_depth: int = 10) -> None:
                     log.warning("Failed to extract nested archive %s: %s", path.name, e)
                     failed.add(path)
     if nested_count > 0:
-        print(f"         {c_ok(f'{nested_count} sub-pack extracted')}")
+        ui_status("ok", f"{plural(nested_count, 'sub-pack')} extracted.")
 
 
 def temp_extract_dir(archive: Path) -> Path:
     """Local extract folder: .temp-addonInstaller/<addon-name>."""
+    if DRY_RUN:
+        raise RuntimeError("Dry-run must not create extraction directories.")
     temp_root = Path(__file__).resolve().parent / ".temp-addonInstaller"
     temp_root.mkdir(parents=True, exist_ok=True)
     name = clean_name(archive.name)
@@ -586,6 +659,8 @@ def temp_extract_dir(archive: Path) -> Path:
 
 def extract_archive_to_temp(archive: Path) -> Path:
     """Extract archive (zip or tar) to a temp directory and return its path."""
+    if DRY_RUN:
+        raise RuntimeError("Dry-run must not create extraction directories.")
     tmp = temp_extract_dir(archive)
     log.info("Prepare temp: %s", tmp)
     if is_tar_file(archive):
@@ -620,38 +695,38 @@ def choose_archive_location(server_dir):
     cwd = Path.cwd().resolve()
 
     while True:
-        print(f"\n{c_bold('Addon source')}")
-        ui_hint(f"Supported: {', '.join(sorted(PACK_EXTS))}, tar archives")
-        ui_option("1", "Browse local folders", f"inside {cwd.name}/")
+        print(c_divider("Addon source"))
+        ui_kv("Project", cwd)
+        ui_option("1", "Browse project folders", f"{cwd.name}/")
         ui_option("2", "Scan server folder", f"{server_dir.name}/")
-        ui_option("3", "Enter manual folder/file path")
-        choice = ask("Choose option", "1")
+        ui_option("3", "Enter custom folder or file")
+        choice = ask("Select option", "1")
 
         if choice == "1":
             folders = sorted([p for p in cwd.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
             # Hide internal folders
             folders = [f for f in folders if not f.name.startswith((".") ) and f.name != "__pycache__"]
             if not folders:
-                ui_empty("No folders found.", "Use a manual folder/file path instead.")
+                ui_status("warn", "No folders in this directory.")
                 continue
-            print(f"\n{c_bold(f'Folders in {cwd.name}/')}")
+            print(c_divider(f"Project folders: {cwd.name}/"))
             for idx, folder in enumerate(folders, 1):
                 count = sum(1 for _ in folder.rglob("*") if _.is_file() and is_pack_file(_))
-                detail = f"{plural(count, 'archive')}" if count > 0 else "no supported archives"
-                ui_option(str(idx), f"{folder.name}/", detail)
-            raw = ask("Choose folder number")
+                count_str = c_green(f"({plural(count, 'file')})") if count > 0 else c_gray("(empty)")
+                ui_option(str(idx), f"{folder.name}/", count_str)
+            raw = ask("Select folder")
             try:
                 index = int(raw)
             except (TypeError, ValueError):
-                print(c_warn("Choice must be a number."))
+                ui_status("warn", "Choice must be a number.")
                 continue
             if index < 1 or index > len(folders):
-                print(c_warn("Invalid folder choice."))
+                ui_status("warn", "Invalid folder choice.")
                 continue
             picked = folders[index - 1]
             pick_count = sum(1 for _ in picked.rglob("*") if _.is_file() and is_pack_file(_))
             if pick_count == 0:
-                ui_empty(f"No addon archives found in {picked.name}/.", "Choose another folder or enter a manual file path.")
+                ui_status("warn", f"No supported addon files in {picked.name}/. Pick another folder.")
                 continue
             return picked
 
@@ -664,11 +739,11 @@ def choose_archive_location(server_dir):
                 continue
             path = Path(manual).expanduser().resolve()
             if not path.exists():
-                print(c_warn(f"Path does not exist: {path}"))
+                ui_status("err", f"Path does not exist: {path}")
                 continue
             return path
 
-        print(c_warn("Choose 1, 2, or 3."))
+        ui_status("warn", "Choose 1, 2, or 3.")
 
 
 def get_key():
@@ -676,6 +751,8 @@ def get_key():
     if sys.platform == "win32":
         import msvcrt
         key = msvcrt.getch()
+        if key == b"\x03":
+            raise KeyboardInterrupt
         if key in (b"\x00", b"\xe0"):
             ext = msvcrt.getch()
             if ext == b"H":
@@ -699,6 +776,8 @@ def get_key():
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
+        if ch == "\x03":
+            raise KeyboardInterrupt
         if ch == "\x1b":
             seq = sys.stdin.read(2)
             if seq == "[A":
@@ -715,30 +794,73 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def render_checkbox_picker(candidates, selected, cursor, search_dirs):
+def archive_installed_hint(archive: Path, installed_keys) -> str:
+    """Return picker hint when an archive contains packs already installed on server."""
+    try:
+        pack_keys = []
+        for _, manifest in load_manifests_from_archive(archive):
+            pack_id = manifest.get("header", {}).get("uuid")
+            if not pack_id:
+                continue
+            for kind in detect_pack_kinds(manifest):
+                pack_keys.append((pack_id, kind))
+    except Exception as e:
+        log.warning("Cannot inspect archive for installed hint %s: %s", archive, e)
+        return ""
+
+    if not pack_keys:
+        return ""
+    installed_count = sum(1 for key in pack_keys if key in installed_keys)
+    if installed_count == len(pack_keys):
+        return c_yellow("(already installed)")
+    if installed_count:
+        return c_yellow("(partially installed)")
+    return ""
+
+def build_archive_hints(candidates, server_dir):
+    installed_keys = {
+        (pack.get("pack_id"), pack.get("kind"))
+        for pack in get_installed_addons(server_dir)
+        if pack.get("pack_id") and pack.get("kind")
+    }
+    if not installed_keys:
+        return {}
+    return {
+        path: hint
+        for path in candidates
+        if (hint := archive_installed_hint(path, installed_keys))
+    }
+
+def render_checkbox_picker(candidates, selected, cursor, search_dirs, archive_hints):
     """Render the interactive addon picker."""
     print("\033[2J\033[H", end="")
     scan_names = ", ".join(d.name for d in search_dirs if d.exists())
     print(c_divider("Select addons"))
-    ui_hint(f"Found {plural(len(candidates), 'archive')} \u00b7 Scan: {scan_names}")
-    for i, path in enumerate(candidates):
-        pointer = c_cyan("\u203a") if i == cursor else " "
-        mark = c_green("\u2713") if i in selected else " "
-        folder = c_gray(f'({path.parent.name}/)')
-        print(f"  {pointer} [{mark}] {i + 1}. {path.name} {folder}")
+    ui_kv("Found", plural(len(candidates), "file"))
+    ui_kv("Selected", plural(len(selected), "file"))
+    ui_kv("Source", scan_names or "-")
     print()
-    ui_hint("\u2191/\u2193 move \u00b7 Space select \u00b7 Enter install")
-    ui_hint("a all \u00b7 c clear \u00b7 r refresh \u00b7 m manual file \u00b7 q cancel")
+    for i, path in enumerate(candidates):
+        pointer = ">" if i == cursor else " "
+        mark = "x" if i in selected else " "
+        folder = c_gray(f'({path.parent.name}/)')
+        hint = archive_hints.get(path, "")
+        suffix = f" {hint}" if hint else ""
+        print(f"  {pointer} [{mark}] {i + 1}. {path.name} {folder}{suffix}")
+    print()
+    ui_kv("Keys", "↑/↓ move · Space select · Enter continue")
+    ui_kv("Shortcuts", "a all · c clear · r refresh · m add file · q cancel")
 
 
-def choose_archives_keyboard(candidates, search_dirs):
+def choose_archives_keyboard(candidates, search_dirs, server_dir):
     """Choose addons with arrow keys + Space."""
     if not candidates:
         return []
     cursor = 0
     selected = set()
+    archive_hints = build_archive_hints(candidates, server_dir)
     while True:
-        render_checkbox_picker(candidates, selected, cursor, search_dirs)
+        render_checkbox_picker(candidates, selected, cursor, search_dirs, archive_hints)
         key = get_key()
         if key == "up":
             cursor = (cursor - 1) % len(candidates)
@@ -760,6 +882,8 @@ def choose_archives_keyboard(candidates, search_dirs):
             old_selected_paths = {candidates[i] for i in selected}
             candidates.clear()
             candidates.extend(list_archives(search_dirs))
+            archive_hints.clear()
+            archive_hints.update(build_archive_hints(candidates, server_dir))
             selected.clear()
             for i, path in enumerate(candidates):
                 if path in old_selected_paths:
@@ -771,14 +895,24 @@ def choose_archives_keyboard(candidates, search_dirs):
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(c_warn(f"File does not exist: {manual_path}"))
+                    ui_status("err", f"File does not exist: {manual_path}")
                     input("Press Enter to continue...")
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(c_warn(f"File is not a Bedrock addon/template/archive: {manual_path}"))
+                    ui_status("err", f"File is not a Bedrock addon/template/archive: {manual_path}")
                     input("Press Enter to continue...")
                     continue
                 candidates.append(manual_path)
+                hint = archive_installed_hint(
+                    manual_path,
+                    {
+                        (pack.get("pack_id"), pack.get("kind"))
+                        for pack in get_installed_addons(server_dir)
+                        if pack.get("pack_id") and pack.get("kind")
+                    },
+                )
+                if hint:
+                    archive_hints[manual_path] = hint
                 selected.add(len(candidates) - 1)
                 cursor = len(candidates) - 1
         elif key == "q":
@@ -786,19 +920,23 @@ def choose_archives_keyboard(candidates, search_dirs):
             return []
 
 
-def choose_archives_text(candidates, search_dirs):
-    """Text-based addon picker fallback."""
+def choose_archives_text(candidates, search_dirs, server_dir):
+    """Text-input fallback addon picker."""
     selected = set()
+    archive_hints = build_archive_hints(candidates, server_dir)
     while True:
         print(c_divider("Select addons"))
-        ui_hint(f"Found {plural(len(candidates), 'archive')}")
+        ui_kv("Found", plural(len(candidates), "file"))
+        ui_kv("Selected", plural(len(selected), "file"))
         for i, path in enumerate(candidates, 1):
-            mark = c_green("✓") if i in selected else " "
-            folder = c_gray(f'({path.parent.name}/)')
-            print(f"  [{mark}] {i}. {path.name} {folder}")
+            mark = "x" if i in selected else " "
+            folder = f'({path.parent.name}/)'
+            hint = archive_hints.get(path, "")
+            suffix = f" {hint}" if hint else ""
+            print(f"  [{mark}] {i}. {path.name} {folder}{suffix}")
         print()
-        ui_hint("Numbers toggle selection, example: 1 or 1,3")
-        ui_hint("a all · c clear · r refresh · 0 manual file · empty install")
+        ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
+        ui_kv("Shortcuts", "a all · c clear · r refresh · 0 add file · Enter continue")
 
         choice = ask("Choose addon/template", "")
         if choice == "":
@@ -813,23 +951,35 @@ def choose_archives_text(candidates, search_dirs):
             old_selected_paths = {candidates[i - 1] for i in selected}
             candidates.clear()
             candidates.extend(list_archives(search_dirs))
+            archive_hints.clear()
+            archive_hints.update(build_archive_hints(candidates, server_dir))
             selected.clear()
             for i, path in enumerate(candidates, 1):
                 if path in old_selected_paths:
                     selected.add(i)
-            print(c_ok(f"Refreshed: {plural(len(candidates), 'archive')} found."))
+            ui_status("ok", f"Refreshed: {plural(len(candidates), 'file')} found.")
             continue
         if choice == "0":
             manual = ask("File path")
             if manual:
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
-                    print(c_warn(f"File does not exist: {manual_path}"))
+                    ui_status("err", f"File does not exist: {manual_path}")
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
-                    print(c_warn(f"File is not a Bedrock addon/template/archive: {manual_path}"))
+                    ui_status("err", f"File is not a Bedrock addon/template/archive: {manual_path}")
                     continue
                 candidates.append(manual_path)
+                hint = archive_installed_hint(
+                    manual_path,
+                    {
+                        (pack.get("pack_id"), pack.get("kind"))
+                        for pack in get_installed_addons(server_dir)
+                        if pack.get("pack_id") and pack.get("kind")
+                    },
+                )
+                if hint:
+                    archive_hints[manual_path] = hint
                 selected.add(len(candidates))
             continue
 
@@ -847,7 +997,7 @@ def choose_archives_text(candidates, search_dirs):
             else:
                 selected.add(index)
         if not ok:
-            print(c_warn("Invalid choice. Use numbers, example: 1 or 1,3."))
+            ui_status("warn", "Invalid choice. Use numbers, example: 1 or 1,3.")
 
     return [candidates[i - 1] for i in sorted(selected)]
 
@@ -857,7 +1007,7 @@ def choose_archives(server_dir):
         source = choose_archive_location(server_dir)
         if source.is_file():
             if not is_pack_file(source):
-                print(c_warn(f"File is not a Bedrock addon/template/archive: {source}"))
+                ui_status("err", f"File is not a Bedrock addon/template/archive: {source}")
                 continue
             return [source]
 
@@ -865,22 +1015,13 @@ def choose_archives(server_dir):
         candidates = list_archives(search_dirs)
         if candidates:
             break
-        ui_empty(f"No supported addon archives found in {source.name}/.", "Choose another location or enter a manual file path.")
+        ui_status("warn", f"No supported addon archives found in {source.name}/.")
+        ui_status("info", "Pick another source.")
 
     if sys.stdin.isatty():
-        return choose_archives_keyboard(candidates, search_dirs)
-    return choose_archives_text(candidates, search_dirs)
+        return choose_archives_keyboard(candidates, search_dirs, server_dir)
+    return choose_archives_text(candidates, search_dirs, server_dir)
 
-
-
-def manifest_dependencies(manifest):
-    deps = []
-    for dep in manifest.get("dependencies", []):
-        uuid = dep.get("uuid")
-        version = dep.get("version")
-        if uuid:
-            deps.append({"uuid": uuid, "version": version})
-    return deps
 
 
 def install_pack_dir(pack_dir, manifest, server_dir):
@@ -896,8 +1037,9 @@ def install_pack_dir(pack_dir, manifest, server_dir):
     # Validate UUID format before use
     validate_uuid(pack_id, context=str(pack_dir))
     version = version_array(header.get("version"))
+    pack_name = manifest_display_name(pack_dir, manifest)
     log.info("Pack found: %s | kind=%s | uuid=%s | version=%s",
-             header.get('name', pack_dir.name), kinds, pack_id, version)
+             pack_name, kinds, pack_id, version)
 
     installed = []
     for kind in kinds:
@@ -906,16 +1048,36 @@ def install_pack_dir(pack_dir, manifest, server_dir):
             base.mkdir(parents=True, exist_ok=True)
         else:
             action(f"Ensure dir: {base}")
-        dest = base / pack_folder_name(pack_dir, manifest)
-        safe_copytree(pack_dir, dest)
-        installed.append({
+        dest = base / pack_folder_name(pack_dir, manifest, kind)
+        replaced_path = None
+        replaced_backup = None
+        existing_dest = find_installed_pack_path(server_dir, pack_id, kind)
+        if existing_dest and existing_dest.resolve() != dest.resolve():
+            if yes_no(f"Pack UUID already exists in {existing_dest.name}. Replace and rename folder?", True):
+                replaced_path = existing_dest
+                replaced_backup = backup_existing(existing_dest)
+                log.info("Remove old pack folder after rename: %s", existing_dest)
+                if not DRY_RUN:
+                    shutil.rmtree(existing_dest)
+            else:
+                raise RuntimeError("Cancelled because the pack UUID is already installed.")
+        record = {
             "pack_id": pack_id,
             "version": version,
             "path": str(dest),
-            "name": header.get("name", pack_dir.name),
+            "backup": None,
+            "replaced_path": str(replaced_path) if replaced_path else None,
+            "replaced_backup": str(replaced_backup) if replaced_backup else None,
+            "name": pack_name,
             "kind": kind,
             "dependencies": manifest_dependencies(manifest),
-        })
+        }
+        # Track the replacement before copying the new pack. If safe_copytree fails
+        # after an old UUID-matching folder was moved/removed, rollback_install()
+        # can still restore replaced_path from replaced_backup.
+        installed.append(record)
+        backup = safe_copytree(pack_dir, dest)
+        record["backup"] = str(backup) if backup else None
     return installed
 
 
@@ -931,30 +1093,84 @@ def import_world_dir(src_world, server_dir):
     default_name = default_name or src_world.name
     world_name = safe_world_name(ask(f"World name to import from template {src_world.name}", default_name))
     dest = safe_child_path(worlds_dir, world_name, world_name)
-    safe_copytree(src_world, dest)
-    return dest
+    backup = safe_copytree(src_world, dest)
+    return {"path": dest, "backup": backup}
 
 
-def load_manifests_from_archive(archive: Path):
-    """Read manifest.json directly from the archive without full extraction."""
+def is_pack_name(name: str) -> bool:
+    lower_name = name.lower()
+    return Path(lower_name).suffix in PACK_EXTS or any(lower_name.endswith(ext) for ext in TAR_EXTS)
+
+def parse_manifest_bytes(source_label: str, data: bytes):
+    try:
+        return json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        ui_status("warn", f"Skip invalid manifest: {source_label} ({e})")
+        log.warning("Skip invalid manifest %s: %s", source_label, e)
+        return None
+
+def load_manifests_from_zip_file(z, source_label: str, depth: int, max_depth: int):
+    manifests = []
+    for name in z.namelist():
+        if Path(name).name == "manifest.json":
+            with z.open(name) as src:
+                manifest = parse_manifest_bytes(f"{source_label}!{name}", src.read())
+                if manifest is not None:
+                    manifests.append((f"{source_label}!{name}", manifest))
+            continue
+        if depth >= max_depth or not is_pack_name(name):
+            continue
+        with z.open(name) as src:
+            nested_data = src.read()
+        manifests.extend(load_manifests_from_archive_bytes(nested_data, f"{source_label}!{name}", depth + 1, max_depth))
+    return manifests
+
+def load_manifests_from_tar_file(tf, source_label: str, depth: int, max_depth: int):
+    manifests = []
+    for member in tf.getmembers():
+        if not member.isfile():
+            continue
+        src = tf.extractfile(member)
+        if src is None:
+            continue
+        with src:
+            data = src.read()
+        if Path(member.name).name == "manifest.json":
+            manifest = parse_manifest_bytes(f"{source_label}!{member.name}", data)
+            if manifest is not None:
+                manifests.append((f"{source_label}!{member.name}", manifest))
+            continue
+        if depth >= max_depth or not is_pack_name(member.name):
+            continue
+        manifests.extend(load_manifests_from_archive_bytes(data, f"{source_label}!{member.name}", depth + 1, max_depth))
+    return manifests
+
+def load_manifests_from_archive_bytes(data: bytes, source_label: str, depth: int, max_depth: int):
+    if depth > max_depth:
+        ui_status("warn", f"Dry-run nested archive depth limit reached: {source_label}")
+        return []
+    bio = io.BytesIO(data)
+    if zipfile.is_zipfile(bio):
+        bio.seek(0)
+        with zipfile.ZipFile(bio) as z:
+            return load_manifests_from_zip_file(z, source_label, depth, max_depth)
+    bio.seek(0)
+    try:
+        with tarfile.open(fileobj=bio, mode="r:*") as tf:
+            return load_manifests_from_tar_file(tf, source_label, depth, max_depth)
+    except tarfile.TarError:
+        ui_status("warn", f"Dry-run skipped unsupported nested archive: {source_label}")
+        return []
+
+def load_manifests_from_archive(archive: Path, max_depth: int = 10):
+    """Read manifest.json from an archive and nested pack archives without full install extraction."""
     manifests = []
     if is_tar_file(archive):
         with tarfile.open(archive) as tf:
-            for member in tf.getmembers():
-                if Path(member.name).name != "manifest.json" or not member.isfile():
-                    continue
-                src = tf.extractfile(member)
-                if src is None:
-                    continue
-                with src:
-                    manifests.append((member.name, json.loads(src.read().decode("utf-8-sig"))))
+            manifests.extend(load_manifests_from_tar_file(tf, archive.name, 0, max_depth))
     else:
         with zipfile.ZipFile(archive) as z:
-            for name in z.namelist():
-                if Path(name).name != "manifest.json":
-                    continue
-                with z.open(name) as src:
-                    manifests.append((name, json.loads(src.read().decode("utf-8-sig"))))
+            manifests.extend(load_manifests_from_zip_file(z, archive.name, 0, max_depth))
     return manifests
 
 
@@ -967,7 +1183,7 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     validate_uuid(pack_id, f"manifest {manifest_name} header.uuid")
     kinds = detect_pack_kinds(manifest)
     if not kinds:
-        print(f"Skip manifest without resource/data module: {manifest_name}")
+        ui_status("warn", f"Skip manifest without resource/data module: {manifest_name}")
         return installed
 
     for kind in kinds:
@@ -976,12 +1192,13 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
         virtual_pack_dir = Path(manifest_name).parent
         if str(virtual_pack_dir) in ("", "."):
             virtual_pack_dir = Path(archive_stem_from_manifest(manifest_name))
-        dest = base / pack_folder_name(virtual_pack_dir, manifest)
+        dest = base / pack_folder_name(virtual_pack_dir, manifest, kind)
         action(f"Would install: {manifest_name} → {dest}")
         installed.append({
             "pack_id": pack_id,
             "version": version,
             "path": str(dest),
+            "backup": None,
             "name": header.get("name", virtual_pack_dir.name),
             "kind": kind,
             "dependencies": manifest_dependencies(manifest),
@@ -989,26 +1206,119 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     return installed
 
 
-def archive_stem_from_manifest(manifest_name: str) -> str:
-    parent = Path(manifest_name).parent
-    return parent.name if str(parent) not in ("", ".") else "pack"
+def build_archive_batch_context(archives, server_dir):
+    """Inspect selected archives so Step 4 can explain split BP/RP installs."""
+    archive_items = {}
+    selected_ids = set()
+    server_ids = {
+        pack.get("pack_id")
+        for pack in get_installed_addons(server_dir)
+        if pack.get("pack_id")
+    }
+    bp_count = 0
+    rp_count = 0
+    dependencies = []
+
+    for archive in archives:
+        archive_path = Path(archive).expanduser().resolve()
+        try:
+            items = load_manifests_from_archive(archive_path)
+        except Exception as e:
+            log.warning("Cannot pre-scan archive %s: %s", archive_path, e)
+            archive_items[archive_path] = []
+            continue
+        archive_items[archive_path] = items
+        for _, manifest in items:
+            header = manifest.get("header", {})
+            pack_id = header.get("uuid")
+            kinds = detect_pack_kinds(manifest)
+            if pack_id and kinds:
+                selected_ids.add(pack_id)
+            if "bp" in kinds:
+                bp_count += 1
+            if "rp" in kinds:
+                rp_count += 1
+            dependencies.extend(manifest_dependencies(manifest))
+
+    return {
+        "archive_items": archive_items,
+        "available_ids": selected_ids | server_ids,
+        "selected_ids": selected_ids,
+        "server_ids": server_ids,
+        "bp_count": bp_count,
+        "rp_count": rp_count,
+        "dependencies": dependencies,
+    }
 
 
-def process_archive(archive, server_dir):
+def print_archive_batch_overview(context, archive_count) -> None:
+    """Print a compact overview before individual archive processing."""
+    print(c_divider("Selected Content"))
+    ui_kv("Archives", plural(archive_count, "archive"))
+    ui_kv("Detected", f"{context['bp_count']} BP, {context['rp_count']} RP")
+    if context["bp_count"] and context["rp_count"]:
+        ui_status("ok", "BP/RP packs are present across this install batch.")
+    elif context["bp_count"]:
+        ui_status("warn", "Only Behavior Packs detected in the selected archives.")
+    elif context["rp_count"]:
+        ui_status("warn", "Only Resource Packs detected in the selected archives.")
+
+    deps = context["dependencies"]
+    if deps:
+        matched = sum(1 for dep in deps if dep["uuid"] in context["available_ids"])
+        if matched == len(deps):
+            ui_status("ok", f"Manifest dependencies found: {matched}/{len(deps)}.")
+        else:
+            ui_status("warn", f"Manifest dependencies found: {matched}/{len(deps)}.")
+
+
+def print_pack_kind_notice(pack_items, batch_available_ids=None) -> None:
+    """Highlight whether this archive contains BP, RP, or both."""
+    batch_available_ids = batch_available_ids or set()
+    bp_count = sum(1 for _, manifest in pack_items if "bp" in detect_pack_kinds(manifest))
+    rp_count = sum(1 for _, manifest in pack_items if "rp" in detect_pack_kinds(manifest))
+    dependencies = [
+        dep
+        for _, manifest in pack_items
+        for dep in manifest_dependencies(manifest)
+    ]
+    matched_deps = [dep for dep in dependencies if dep["uuid"] in batch_available_ids]
+    if bp_count and rp_count:
+        ui_status("ok", f"Detected both Behavior Pack and Resource Pack ({bp_count} BP, {rp_count} RP).")
+    elif bp_count:
+        if matched_deps:
+            ui_status("info", f"This archive contains Behavior Pack only ({bp_count} BP, 0 RP); dependency found in selected/server packs.")
+        else:
+            ui_status("warn", f"This archive contains Behavior Pack only ({bp_count} BP, 0 RP). Install its companion pack separately if needed.")
+    elif rp_count:
+        ui_status("info", f"This archive contains Resource Pack only (0 BP, {rp_count} RP).")
+    else:
+        ui_status("warn", "No Behavior Pack or Resource Pack module detected in this archive.")
+
+
+def process_archive(archive, server_dir, batch_context=None):
     archive = Path(archive).expanduser().resolve()
+    batch_context = batch_context or {}
+    batch_available_ids = batch_context.get("available_ids", set())
     # Validate archive size and integrity before extraction
     validate_archive(archive)
     size_mb = archive.stat().st_size / (1024 * 1024)
 
     if DRY_RUN:
-        print(f"         {c_yellow('[DRY-RUN] Reading manifest without full extraction')}")
+        ui_status("warn", "Dry-run: reading manifest without full extraction.")
         installed = []
-        for manifest_name, manifest in load_manifests_from_archive(archive):
-            installed.extend(dry_run_install_manifest(manifest_name, manifest, server_dir))
+        manifest_items = load_manifests_from_archive(archive)
+        print_pack_kind_notice(manifest_items, batch_available_ids)
+        for manifest_name, manifest in manifest_items:
+            try:
+                installed.extend(dry_run_install_manifest(manifest_name, manifest, server_dir))
+            except Exception as e:
+                ui_status("warn", f"Skip invalid manifest: {manifest_name} ({e})")
+                log.warning("Skip invalid manifest %s in %s: %s", manifest_name, archive, e)
         return installed, []
 
     # Step: Extract
-    print(f"         {c_info(f'Extracting ({size_mb:.1f} MB)...')}")
+    ui_status("info", f"Extracting archive ({size_mb:.1f} MB).")
     tmp = extract_archive_to_temp(archive)
     installed = []
     imported_worlds = []
@@ -1016,19 +1326,31 @@ def process_archive(archive, server_dir):
         # Step: Scan content
         manifests, world_dirs = scan_addon_content(tmp)
         pack_count = len(manifests)
-        print(f"         {c_ok(f'{pack_count} pack(s) found')}")
+        ui_status("ok", f"{plural(pack_count, 'pack')} found.")
+
+        manifest_items = []
+        for manifest_path in manifests:
+            try:
+                manifest_items.append((manifest_path, load_json(manifest_path)))
+            except Exception as e:
+                ui_status("warn", f"Skip invalid manifest: {manifest_path} ({e})")
+                log.warning("Skip invalid manifest %s: %s", manifest_path, e)
+        print_pack_kind_notice(manifest_items, batch_available_ids)
 
         # Step: Install pack
-        for manifest_path in manifests:
-            manifest = load_json(manifest_path)
-            header = manifest.get("header", {})
-            pack_name = header.get("name", manifest_path.parent.name)
-            kinds = detect_pack_kinds(manifest)
-            kind_labels = "/".join(k.upper() for k in kinds) if kinds else "?"
-            result = install_pack_dir(manifest_path.parent, manifest, server_dir)
-            if result:
-                print(f"         {c_ok(f'Install {kind_labels}: {pack_name}')}")
-            installed.extend(result)
+        for manifest_path, manifest in manifest_items:
+            try:
+                header = manifest.get("header", {})
+                pack_name = manifest_display_name(manifest_path.parent, manifest)
+                kinds = detect_pack_kinds(manifest)
+                kind_labels = "/".join(k.upper() for k in kinds) if kinds else "?"
+                result = install_pack_dir(manifest_path.parent, manifest, server_dir)
+                if result:
+                    ui_status("ok", f"Installed {kind_labels}: {pack_name}")
+                installed.extend(result)
+            except Exception as e:
+                ui_status("warn", f"Skip invalid manifest: {manifest_path} ({e})")
+                log.warning("Skip invalid manifest %s: %s", manifest_path, e)
 
         for world_dir in world_dirs:
             if yes_no(f"Template/world detected: {world_dir.name}. Import world?", True):
@@ -1046,7 +1368,7 @@ def read_pack_list(path):
         return data if isinstance(data, list) else []
     except json.JSONDecodeError:
         backup_existing(path)
-        print(f"Broken JSON: {path}. It will be rewritten as an empty list plus new packs.")
+        ui_status("warn", f"Broken JSON: {path}. It will be rewritten as an empty list plus new packs.")
         return []
 
 
@@ -1056,8 +1378,8 @@ def enable_pack(world_dir, installed):
     packs = read_pack_list(path)
     packs = [p for p in packs if p.get("pack_id") != installed["pack_id"]]
     packs.append({"pack_id": installed["pack_id"], "version": installed["version"]})
-    write_text(path, json.dumps(packs, indent=2) + "\n")
-    return path
+    backup = write_text(path, json.dumps(packs, indent=2) + "\n")
+    return path, backup
 
 
 def check_texturepack_required(server_dir):
@@ -1088,30 +1410,31 @@ def set_texturepack_required(server_dir):
     if not found:
         new_lines.append("texturepack-required=true")
     # Use consistent newlines (\n) for cross-platform compatibility
-    write_text(props, "\n".join(new_lines) + "\n")
+    return write_text(props, "\n".join(new_lines) + "\n")
 
 
-def print_world_choices(title, worlds):
-    print(f"\n{c_bold(title)}")
-    for i, world in enumerate(worlds, 1):
-        ui_option(str(i), world.name)
-
+def imported_world_path(world):
+    return world["path"] if isinstance(world, dict) else world
 
 def choose_world(server_dir, imported_worlds):
     if imported_worlds:
-        print_world_choices("Imported worlds", imported_worlds)
-        if yes_no("Use an imported world to enable packs?", True):
+        print(c_divider("Imported Worlds"))
+        for i, w in enumerate(imported_worlds, 1):
+            path = imported_world_path(w)
+            ui_option(str(i), path.name, str(path))
+        if yes_no("Use this imported world to enable packs?", True):
             if len(imported_worlds) == 1:
-                return imported_worlds[0]
+                return imported_world_path(imported_worlds[0])
+            # Handle non-integer input without crashing
             while True:
                 raw = ask("Choose imported world", "1")
                 try:
                     idx = int(raw)
                     if 1 <= idx <= len(imported_worlds):
-                        return imported_worlds[idx - 1]
-                    print(c_warn(f"Choose a number 1-{len(imported_worlds)}."))
+                        return imported_world_path(imported_worlds[idx - 1])
+                    ui_status("warn", f"Choose a number 1-{len(imported_worlds)}.")
                 except ValueError:
-                    print(c_warn("Enter a valid number."))
+                    ui_status("warn", "Enter a valid number.")
 
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
@@ -1121,8 +1444,11 @@ def choose_world(server_dir, imported_worlds):
     existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
 
     if existing:
-        print_world_choices("World folders", existing)
+        print(c_divider("World Folders"))
+        for i, w in enumerate(existing, 1):
+            ui_option(str(i), w.name)
         ui_option("0", "Create/use another name")
+        # Handle non-integer input without crashing
         while True:
             choice = ask("Choose world", "1")
             try:
@@ -1131,14 +1457,15 @@ def choose_world(server_dir, imported_worlds):
                     break
                 if 1 <= idx <= len(existing):
                     return existing[idx - 1]
-                print(c_warn(f"Choose a number 0-{len(existing)}."))
+                ui_status("warn", f"Choose a number 0-{len(existing)}.")
             except ValueError:
-                print(c_warn("Enter a valid number."))
+                ui_status("warn", "Enter a valid number.")
 
     prop_name = read_server_level_name(server_dir)
     default_name = prop_name or "Bedrock level"
 
-    ui_empty("No world folders found.", f"Default name from server.properties: {default_name}")
+    ui_status("warn", "No world folder exists in this server yet.")
+    ui_kv("Default", default_name)
 
     if yes_no(f"Create world named \"{default_name}\"?", True):
         world_name = safe_world_name(default_name)
@@ -1153,15 +1480,24 @@ def choose_world(server_dir, imported_worlds):
     return world_dir
 
 
-def check_dependencies(installed):
-    installed_ids = {p["pack_id"] for p in installed}
-    missing = []
-    for pack in installed:
-        for dep in pack.get("dependencies", []):
-            if dep["uuid"] not in installed_ids:
-                missing.append((pack, dep))
-    return missing
-
+def choose_existing_world(server_dir):
+    worlds_dir = server_dir / "worlds"
+    existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    if not existing:
+        ui_status("warn", "No world folders found.")
+        return None
+    print(c_divider("Choose world"))
+    for i, world in enumerate(existing, 1):
+        ui_option(str(i), world.name)
+    while True:
+        raw = ask("Choose world", "1")
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(existing):
+                return existing[idx - 1]
+            ui_status("warn", f"Choose a number 1-{len(existing)}.")
+        except ValueError:
+            ui_status("warn", "Enter a valid number.")
 
 def _tick(cond: bool) -> str:
     """Check/cross symbol with color when available."""
@@ -1171,41 +1507,55 @@ def _tick(cond: bool) -> str:
 
 
 def print_summary(archive_results, dep_missing) -> None:
-    """Print a clean per-archive install summary."""
+    """Print a separate summary for each addon/archive."""
     for archive_name, packs, worlds in archive_results:
-        print(c_divider(f"Summary · {archive_name}"))
+        print(c_divider(f"Summary: {archive_name}"))
+        ui_kv("Installed", plural(len(packs), "pack"))
+        ui_kv("Imported worlds", plural(len(worlds), "world"))
+        if DRY_RUN:
+            ui_kv("Mode", c_yellow("DRY-RUN"))
 
+        # Show processed addon name and UUID
         seen = set()
         for p in packs:
             pid = p["pack_id"]
             if pid not in seen:
                 seen.add(pid)
-                print(f"  {c_ok(p['name'])} {c_gray(pid)}")
+                ui_status("ok", f"{p['name']} {c_gray('(' + pid + ')')}")
 
-        if DRY_RUN:
-            print(f"  {c_yellow('Mode')}       dry-run preview")
-
+        # BP Included
         bp_packs = [x for x in packs if x["kind"] == "bp"]
+        has_bp = len(bp_packs) > 0
+        ui_kv("Behavior pack", _tick(True) if has_bp else c_gray("not included"))
+        if has_bp:
+            for p in bp_packs:
+                ui_kv("  Location", p["path"])
+                ui_kv("  Version", ".".join(map(str, p["version"])))
+
+        # RP Included
         rp_packs = [x for x in packs if x["kind"] == "rp"]
-        print(f"  BP packs   {_tick(bool(bp_packs))} {plural(len(bp_packs), 'pack')}")
-        for p in bp_packs:
-            print(f"    {c_gray('path')}    {p['path']}")
-            print(f"    {c_gray('version')} {'.'.join(map(str, p['version']))}")
+        has_rp = len(rp_packs) > 0
+        ui_kv("Resource pack", _tick(True) if has_rp else c_gray("not included"))
+        if has_rp:
+            for p in rp_packs:
+                ui_kv("  Location", p["path"])
+                ui_kv("  Version", ".".join(map(str, p["version"])))
 
-        print(f"  RP packs   {_tick(bool(rp_packs))} {plural(len(rp_packs), 'pack')}")
-        for p in rp_packs:
-            print(f"    {c_gray('path')}    {p['path']}")
-            print(f"    {c_gray('version')} {'.'.join(map(str, p['version']))}")
-
-        print(f"  Worlds     {_tick(bool(worlds))} {plural(len(worlds), 'import')}")
+        # World Import
         for w in worlds:
-            print(f"    {c_gray('path')}    {w}")
+            ui_kv("  World", imported_world_path(w))
 
+        # Missing Deps per addon
         pack_ids = {p["pack_id"] for p in packs}
         local_missing = [(p, d) for p, d in dep_missing if p["pack_id"] in pack_ids]
-        print(f"  Deps       {_tick(not local_missing)} {plural(len(local_missing), 'missing dependency')}")
-        for pack, dep in local_missing:
-            print(f"    {c_err(pack['name'])} needs {c_yellow(dep['uuid'])} version {dep.get('version')}")
+        if local_missing:
+            ui_status("err", f"Action needed: {plural(len(local_missing), 'missing manifest dependency', 'missing manifest dependencies')}.")
+            ui_kv("  Note", "Dependency type is unknown; it may be BP, RP, or another pack.")
+            for pack, dep in local_missing:
+                ui_kv("  Pack", c_err(pack["name"]))
+                ui_kv("  Needs", f"{c_yellow(dep['uuid'])} version {dep.get('version')} (type unknown)")
+        else:
+            ui_status("ok", "No missing dependencies.")
 
 
 # Built-in Minecraft folder prefixes/patterns that must not be deleted
@@ -1246,7 +1596,7 @@ def get_installed_addons(server_dir):
                 header = manifest.get("header", {})
                 installed.append({
                     "path": pack_dir,
-                    "name": header.get("name", pack_dir.name),
+                    "name": manifest_display_name(pack_dir, manifest),
                     "pack_id": header.get("uuid"),
                     "kind": kind
                 })
@@ -1254,18 +1604,277 @@ def get_installed_addons(server_dir):
                 log.warning("Failed to read %s: %s", manifest_path, e)
     return installed
 
+def world_pack_order_maps(world_dir):
+    """Return pack_id order maps for a world's BP/RP JSON files."""
+    order_maps = {}
+    for kind, file_name in (("rp", "world_resource_packs.json"), ("bp", "world_behavior_packs.json")):
+        entries = read_pack_list(world_dir / file_name)
+        order_maps[kind] = {
+            entry.get("pack_id"): index
+            for index, entry in enumerate(entries)
+            if entry.get("pack_id")
+        }
+    return order_maps
+
+def sort_addons_for_uninstall(candidates, world_dir=None):
+    """Sort uninstall candidates by world pack-stack order when a world is selected."""
+    if not world_dir:
+        return candidates
+    order_maps = world_pack_order_maps(world_dir)
+    kind_order = {"rp": 0, "bp": 1}
+    return sorted(
+        candidates,
+        key=lambda pack: (
+            kind_order.get(pack["kind"], 9),
+            order_maps.get(pack["kind"], {}).get(pack.get("pack_id"), 999999),
+            pack["name"].lower(),
+        ),
+    )
+
+def default_world_dir(server_dir):
+    worlds_dir = server_dir / "worlds"
+    prop_name = read_server_level_name(server_dir)
+    if prop_name and (worlds_dir / prop_name).is_dir():
+        return worlds_dir / prop_name
+    existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    return existing[0] if len(existing) == 1 else None
+
+def print_installed_addon_overview(server_dir, world_dir=None):
+    """Show installed addons grouped by display name before choosing an action."""
+    installed = get_installed_addons(server_dir)
+    print()
+    print(c_bold("Installed addons on this server"))
+    if not installed:
+        ui_status("warn", "No installed addons found.")
+        return
+
+    order_maps = world_pack_order_maps(world_dir) if world_dir else {}
+    grouped = {}
+    for pack in installed:
+        item = grouped.setdefault(pack["name"], {"kinds": set(), "order": 999999})
+        item["kinds"].add(pack["kind"])
+        order = order_maps.get(pack["kind"], {}).get(pack.get("pack_id"), 999999)
+        item["order"] = min(item["order"], order)
+
+    if world_dir:
+        ui_kv("Order", world_dir.name)
+
+    for idx, (name, data) in enumerate(sorted(grouped.items(), key=lambda item: (item[1]["order"], item[0].lower())), 1):
+        kinds = data["kinds"]
+        labels = []
+        if "bp" in kinds:
+            labels.append("BP")
+        if "rp" in kinds:
+            labels.append("RP")
+        kind_text = c_cyan(f"[{'/'.join(labels)}]")
+        print(f"  {idx}. {kind_text} {name}")
+
+def installed_pack_name_map(server_dir):
+    return {
+        (pack.get("pack_id"), pack.get("kind")): pack.get("name")
+        for pack in get_installed_addons(server_dir)
+        if pack.get("pack_id") and pack.get("kind")
+    }
+
+def world_pack_reorder_options(world_dir):
+    options = []
+    for kind, file_name, label in (
+        ("bp", "world_behavior_packs.json", "Behavior Packs"),
+        ("rp", "world_resource_packs.json", "Resource Packs"),
+    ):
+        path = world_dir / file_name
+        entries = read_pack_list(path)
+        if entries:
+            options.append({"kind": kind, "label": label, "path": path, "entries": entries})
+    return options
+
+def choose_reorder_target(world_dir):
+    options = world_pack_reorder_options(world_dir)
+    if not options:
+        ui_status("warn", f"No world pack JSON entries found in {world_dir.name}.")
+        return None
+    if len(options) == 1:
+        return options[0]
+    print(c_divider("Choose pack list"))
+    for i, option in enumerate(options, 1):
+        ui_option(str(i), option["label"], f"({plural(len(option['entries']), 'pack')})")
+    while True:
+        raw = ask("Choose pack list", "1")
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+            ui_status("warn", f"Choose a number 1-{len(options)}.")
+        except ValueError:
+            ui_status("warn", "Enter a valid number.")
+
+def pack_entry_label(entry, kind, name_map):
+    pack_id = entry.get("pack_id", "")
+    name = name_map.get((pack_id, kind)) or f"Unknown pack {pack_id[:8]}"
+    version = entry.get("version")
+    version_text = ".".join(map(str, version)) if isinstance(version, list) else str(version)
+    kind_label = "BP" if kind == "bp" else "RP"
+    return f"[{kind_label}] {name} {c_gray(f'({pack_id[:8]} | v{version_text})')}"
+
+def move_selected(entries, selected, direction):
+    selected = set(selected)
+    order = sorted(selected) if direction < 0 else sorted(selected, reverse=True)
+    for index in order:
+        target = index + direction
+        if target < 0 or target >= len(entries) or target in selected:
+            continue
+        entries[index], entries[target] = entries[target], entries[index]
+        selected.remove(index)
+        selected.add(target)
+    return selected
+
+def render_reorder_picker(entries, selected, cursor, kind, name_map):
+    print("\033[2J\033[H", end="")
+    print(c_divider("Reorder world addons"))
+    ui_kv("Items", plural(len(entries), "pack"))
+    ui_kv("Selected", plural(len(selected), "pack"))
+    print()
+    for i, entry in enumerate(entries):
+        pointer = ">" if i == cursor else " "
+        mark = "x" if i in selected else " "
+        print(f"  {pointer} [{mark}] {i + 1}. {pack_entry_label(entry, kind, name_map)}")
+    print()
+    ui_kv("Keys", "↑/↓ move · Space select")
+    ui_kv("Move", "Selected packs move with ↑/↓")
+    ui_kv("Shortcuts", "a all · c clear · Enter save · q cancel")
+
+def reorder_packs_keyboard(entries, kind, name_map):
+    cursor = 0
+    selected = set()
+    while True:
+        render_reorder_picker(entries, selected, cursor, kind, name_map)
+        key = get_key()
+        if key == "up":
+            if selected:
+                selected = move_selected(entries, selected, -1)
+                cursor = min(selected) if selected else cursor
+            else:
+                cursor = (cursor - 1) % len(entries)
+        elif key == "down":
+            if selected:
+                selected = move_selected(entries, selected, 1)
+                cursor = max(selected) if selected else cursor
+            else:
+                cursor = (cursor + 1) % len(entries)
+        elif key == "space":
+            if cursor in selected:
+                selected.remove(cursor)
+            else:
+                selected.add(cursor)
+        elif key == "a":
+            selected = set(range(len(entries)))
+        elif key == "c":
+            selected.clear()
+        elif key == "enter":
+            print()
+            return True
+        elif key == "q":
+            print()
+            return False
+
+def reorder_packs_text(entries, kind, name_map):
+    selected = set()
+    while True:
+        print(c_divider("Reorder world addons"))
+        ui_kv("Items", plural(len(entries), "pack"))
+        ui_kv("Selected", plural(len(selected), "pack"))
+        for i, entry in enumerate(entries, 1):
+            mark = "x" if i - 1 in selected else " "
+            print(f"  [{mark}] {i}. {pack_entry_label(entry, kind, name_map)}")
+        print()
+        ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
+        ui_kv("Shortcuts", "u up · d down · a all · c clear · Enter save · q cancel")
+        choice = ask("Reorder command", "").lower()
+        if choice == "":
+            return True
+        if choice == "q":
+            return False
+        if choice == "a":
+            selected = set(range(len(entries)))
+            continue
+        if choice == "c":
+            selected.clear()
+            continue
+        if choice == "u":
+            selected = move_selected(entries, selected, -1)
+            continue
+        if choice == "d":
+            selected = move_selected(entries, selected, 1)
+            continue
+        ok = True
+        for part in [p.strip() for p in choice.split(",") if p.strip()]:
+            if not part.isdigit():
+                ok = False
+                break
+            index = int(part) - 1
+            if index < 0 or index >= len(entries):
+                ok = False
+                break
+            if index in selected:
+                selected.remove(index)
+            else:
+                selected.add(index)
+        if not ok:
+            ui_status("warn", "Invalid choice.")
+
+def reorder_addon_flow(server_dir):
+    world_dir = choose_existing_world(server_dir)
+    if not world_dir:
+        return
+    target = choose_reorder_target(world_dir)
+    if not target:
+        return
+    entries = list(target["entries"])
+    name_map = installed_pack_name_map(server_dir)
+    if sys.stdin.isatty():
+        should_save = reorder_packs_keyboard(entries, target["kind"], name_map)
+    else:
+        should_save = reorder_packs_text(entries, target["kind"], name_map)
+    if not should_save:
+        ui_status("warn", "Cancelled. Order was not changed.")
+        return
+    backup = write_text(target["path"], json.dumps(entries, indent=2) + "\n")
+    if DRY_RUN:
+        ui_status("warn", f"Dry-run: would save reordered {target['label']} to {target['path']}")
+        ui_status("info", "Returning to choose action.")
+        return
+
+    committed = False
+    try:
+        ui_status("ok", f"Saved reordered {target['label']}: {target['path']}")
+        if backup:
+            ui_kv("Backup", backup)
+        committed = yes_no("Commit this reorder change?", True)
+    except KeyboardInterrupt:
+        rollback_path(target["path"], backup)
+        ui_status("warn", "Reorder cancelled. Restored previous order.")
+        raise
+    if not committed:
+        rollback_path(target["path"], backup)
+        ui_status("warn", "Reorder discarded. Restored previous order.")
+    else:
+        ui_status("ok", "Reorder committed.")
+    ui_status("info", "Returning to Choose Action.")
+
 def render_checkbox_picker_addons(candidates, selected, cursor):
     print("\033[2J\033[H", end="")
-    print(c_divider("Select addons to delete"))
-    ui_hint(f"Found {plural(len(candidates), 'installed addon')}")
-    for i, p in enumerate(candidates):
-        pointer = c_cyan("›") if i == cursor else " "
-        mark = c_green("✓") if i in selected else " "
-        kind_str = "RP" if p["kind"] == "rp" else "BP"
-        print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} {c_gray('(' + p['path'].name + ')')}")
+    print(c_divider("Select installed addons"))
+    ui_kv("Found", plural(len(candidates), "addon"))
+    ui_kv("Selected", plural(len(selected), "addon"))
     print()
-    ui_hint("↑/↓ move · Space select · Enter delete")
-    ui_hint("a all · c clear · q cancel")
+    for i, p in enumerate(candidates):
+        pointer = ">" if i == cursor else " "
+        mark = "x" if i in selected else " "
+        kind_str = "RP" if p["kind"] == "rp" else "BP"
+        print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} ({p['path'].name})")
+    print()
+    ui_kv("Keys", "↑/↓ move · Space select · Enter remove")
+    ui_kv("Shortcuts", "a all · c clear · q cancel")
 
 def choose_addons_keyboard(candidates):
     if not candidates:
@@ -1298,15 +1907,16 @@ def choose_addons_keyboard(candidates):
 def choose_addons_text(candidates):
     selected = set()
     while True:
-        print(c_divider("Select addons to delete"))
-        ui_hint(f"Found {plural(len(candidates), 'installed addon')}")
+        print(c_divider("Select installed addons"))
+        ui_kv("Found", plural(len(candidates), "addon"))
+        ui_kv("Selected", plural(len(selected), "addon"))
         for i, p in enumerate(candidates, 1):
-            mark = c_green("✓") if i in selected else " "
+            mark = "x" if i in selected else " "
             kind_str = "RP" if p["kind"] == "rp" else "BP"
-            print(f"  [{mark}] {i}. [{kind_str}] {p['name']} {c_gray('(' + p['path'].name + ')')}")
+            print(f"  [{mark}] {i}. [{kind_str}] {p['name']} ({p['path'].name})")
         print()
-        ui_hint("Numbers toggle selection, example: 1 or 1,3")
-        ui_hint("a all · c clear · empty continue")
+        ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
+        ui_kv("Shortcuts", "a all · c clear · Enter continue")
 
         choice = ask("Choose addon to delete", "")
         if choice == "":
@@ -1332,7 +1942,7 @@ def choose_addons_text(candidates):
             else:
                 selected.add(index)
         if not ok:
-            print(c_warn("Invalid choice."))
+            ui_status("warn", "Invalid choice.")
     
     return [candidates[i - 1] for i in sorted(selected)]
 
@@ -1349,19 +1959,24 @@ def disable_pack_in_world(world_dir, pack):
     packs = [p for p in packs if p.get("pack_id") != pack["pack_id"]]
     if len(packs) < original_len:
         log.info("Remove from %s: %s", path.name, pack["name"])
-        if not DRY_RUN:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(packs, indent=2) + "\n", encoding="utf-8")
+        write_text(path, json.dumps(packs, indent=2) + "\n")
         return True
     return False
 
-def uninstall_addon_flow(server_dir):
+def uninstall_addon_flow(server_dir, force_delete=False):
     if not DRY_RUN:
-        ui_hint("Tip: run with --dry-run first to preview uninstall changes.")
+        ui_kv("Tip", "Run with --dry-run first to preview uninstall changes.")
     candidates = get_installed_addons(server_dir)
     if not candidates:
-        ui_empty("No installed addons found.", "Only user-installed packs with manifest.json are shown.")
+        ui_status("warn", "No installed addons found.")
         return
+
+    world_dir = choose_existing_world(server_dir)
+    if world_dir:
+        candidates = sort_addons_for_uninstall(candidates, world_dir)
+        ui_status("info", f"Sorted uninstall list by pack order in world: {world_dir.name}")
+    else:
+        ui_status("warn", "Using folder/name order because no world was selected.")
     
     if sys.stdin.isatty():
         to_remove = choose_addons_keyboard(candidates)
@@ -1369,22 +1984,27 @@ def uninstall_addon_flow(server_dir):
         to_remove = choose_addons_text(candidates)
         
     if not to_remove:
-        print(c_warn("Cancelled, nothing was deleted."))
+        ui_status("warn", "Cancelled. Nothing was removed.")
         return
     
-    # Confirmation before deletion - strong warning
-    print(f"\n{c_red('!' * 50)}")
-    print(f"{c_bold(c_red('  ⚠  WARNING: PERMANENT DELETION  ⚠'))}")
-    print(f"{c_red('!' * 50)}")
-    print(f"\n{c_bold('Addons to be deleted:')}")
+    delete_label = "permanently deleted" if force_delete else "moved to backup folders"
+    if force_delete:
+        print(c_divider(c_red("Warning: permanent deletion")))
+        ui_status("err", "Selected addon folders will be deleted permanently.")
+        ui_status("err", "Recovery is only possible from your own backups.")
+    else:
+        print(c_divider("Uninstall preview"))
+        backup_root = Path(__file__).resolve().parent / ".temp-addonInstaller" / "backups" / clean_name(server_dir.name)
+        ui_status("info", "Selected addon folders will be moved to backups.")
+        ui_kv("Backup root", backup_root)
+    print(f"\n{c_bold('Selected for removal')}")
     for i, pack in enumerate(to_remove, 1):
         kind_str = c_cyan("RP") if pack["kind"] == "rp" else c_cyan("BP")
-        print(f"  {c_red('✗')} {i}. [{kind_str}] {c_bold(pack['name'])}")
-    print(f"\n{c_red('Addon files will be PERMANENTLY DELETED and CANNOT be restored!')}")
+        print(f"  {c_red('x')} {i}. [{kind_str}] {c_bold(pack['name'])}")
     
     confirm = ask(f"\nType {c_bold('DELETE')} to confirm, or press Enter to cancel")
     if confirm != "DELETE":
-        print("Cancelled.")
+        ui_status("warn", "Cancelled.")
         return
 
     worlds_dir = server_dir / "worlds"
@@ -1393,20 +2013,34 @@ def uninstall_addon_flow(server_dir):
     total = len(to_remove)
     removed_names = []
     
-    print(c_divider(f"Deleting {plural(total, 'addon')}"))
+    action_label = "Deleting" if force_delete else "Removing"
+    print(c_divider(f"{action_label} {total} addon(s)"))
     for idx, pack in enumerate(to_remove, 1):
         pack_path = pack["path"]
         kind_label = "RP" if pack["kind"] == "rp" else "BP"
+        backup = uninstall_backup_path(server_dir, pack_path, pack["kind"])
         
-        print(f"\n  [{idx}/{total}] {c_bold(pack['name'])} ({kind_label})")
+        print(f"\n{c_bold(f'[{idx}/{total}]')} {pack['name']} {c_gray(f'({kind_label})')}")
+        ui_kv("Folder", pack_path)
+        if not force_delete:
+            ui_kv("Backup", backup)
         
-        # Permanently delete folder
+        # Remove addon folder. Default is backup move; --force-delete is permanent.
         if not DRY_RUN and pack_path.exists():
-            log.info("Permanently delete: %s", pack_path)
-            shutil.rmtree(pack_path)
-            print(f"         {c_ok('Folder deleted')}")
+            if force_delete:
+                log.info("Permanently delete: %s", pack_path)
+                shutil.rmtree(pack_path)
+                ui_status("ok", "Folder deleted.")
+            else:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                log.info("Move to backup: %s -> %s", pack_path, backup)
+                shutil.move(str(pack_path), str(backup))
+                ui_status("ok", f"Moved to backup: {backup}")
         elif DRY_RUN:
-            print(f"         {c_yellow('[DRY-RUN] Would delete')}")
+            if force_delete:
+                ui_status("warn", f"Dry-run: folder would be {delete_label}.")
+            else:
+                ui_status("warn", f"Dry-run: folder would be moved to backup: {backup}")
         
         # Remove from world config
         cleaned_worlds = 0
@@ -1414,23 +2048,29 @@ def uninstall_addon_flow(server_dir):
             if disable_pack_in_world(w, pack):
                 cleaned_worlds += 1
         if cleaned_worlds > 0:
-            print(f"         {c_ok(f'Removed from {cleaned_worlds} world')}")
+            ui_status("ok", f"Removed from {plural(cleaned_worlds, 'world')}.")
         
         removed_names.append(f"[{kind_label}] {pack['name']}")
     
     # Final summary
     print(c_divider("Uninstall complete"))
-    print(f"  Deleted    {c_green(plural(total, 'addon'))}")
+    total_label = "deleted" if force_delete else "removed"
+    ui_kv(f"Total {total_label}", plural(total, "addon"))
     for name in removed_names:
-        print(f"  {c_ok(name)}")
+        ui_status("ok", name)
     print(c_divider())
-    print(f"  {c_green('\U0001F680 Restart bedrock_server to apply changes.')}")
+    ui_status("ok", "Restart bedrock_server to apply changes.")
     print()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Setup Bedrock RP/BP addons into a server folder.")
     parser.add_argument("--dry-run", action="store_true", help="Preview actions without writing files.")
+    parser.add_argument(
+        "--force-delete",
+        action="store_true",
+        help="Permanently delete addon folders during uninstall instead of moving them to centralized backups.",
+    )
     return parser.parse_args()
 
 
@@ -1446,91 +2086,111 @@ def main():
     args = parse_args()
     DRY_RUN = args.dry_run
 
-    log_file = setup_logging()
+    log_file = setup_logging(DRY_RUN)
     _enable_colors()
     if DRY_RUN:
         log.info("DRY-RUN mode enabled")
 
-    ui_banner(log_file)
+    ui_banner(log_file, args.force_delete)
 
     # Step 1: Choose server
-    print(c_divider("Step 1: Choose Server"))
+    ui_step(1, "Choose server", "Pick Bedrock server folder containing server.properties.")
     server_dir = choose_server_dir()
-    print(f"{c_ok(f'Server: {server_dir.name}/')}")
+    ui_status("ok", f"Server selected: {server_dir}")
 
-    # Step 2: Choose action
-    print(c_divider("Step 2: Choose Action"))
-    ui_option("1", "📥 Install addon", "copy packs and enable them in a world")
-    ui_option("2", "🗑  Uninstall addon", "remove user-installed packs")
     while True:
-        action_choice = ask("Choose action", "1")
-        if action_choice in ("1", "2"):
-            break
-        print(c_warn("Choose 1 or 2."))
+        # Step 2: Choose action
+        ui_step(2, "Choose action")
+        ui_option("1", "Install addon", "copy packs and enable them in a world")
+        ui_option("2", "Uninstall addon", "remove world refs and back up pack folders")
+        ui_option("3", "Reorder world addons", "adjust BP/RP load order")
+        print_installed_addon_overview(server_dir, default_world_dir(server_dir))
+        while True:
+            action_choice = ask("Choose action", "1")
+            if action_choice in ("1", "2", "3"):
+                break
+            ui_status("warn", "Choose 1, 2, or 3.")
 
-    if action_choice == "2":
-        print(c_divider("Uninstall Addon"))
-        uninstall_addon_flow(server_dir)
-        return
-
-    if not DRY_RUN:
-        ui_hint("Tip: run with --dry-run first when installing unknown addons.")
+        if action_choice == "2":
+            print(c_divider("Uninstall addon"))
+            uninstall_addon_flow(server_dir, args.force_delete)
+            return
+        if action_choice == "3":
+            print(c_divider("Reorder world addons"))
+            reorder_addon_flow(server_dir)
+            continue
+        if not DRY_RUN:
+            ui_kv("Tip", "Run with --dry-run first when installing unknown addons.")
+        break
 
     # Step 3: Choose addons
-    print(c_divider("Step 3: Choose Addons"))
+    ui_step(3, "Choose addons", "Select one or more .mcpack/.mcaddon/.mctemplate/.zip/.tar.* files.")
     archives = choose_archives(server_dir)
     if not archives:
-        print(c_warn("No files selected."))
+        ui_status("warn", "No files selected.")
         return
-    print(c_ok(f"{plural(len(archives), 'addon')} selected"))
+    ui_status("ok", f"{plural(len(archives), 'addon')} selected.")
 
     installed = []
     imported_worlds = []
+    config_changes = []
     archive_results = []  # track per-archive results for summary
     total_archives = len(archives)
 
-    # Step 4: Process install
-    print(c_divider(f"Step 4: Install ({plural(total_archives, 'addon')})"))
-    for idx, archive in enumerate(archives, 1):
-        size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
-        print(f"\n  [{idx}/{total_archives}] {c_bold(archive.name)} {c_gray(f'({size_str})')}")
-        packs, worlds = process_archive(archive, server_dir)
-        installed.extend(packs)
-        imported_worlds.extend(worlds)
-        archive_results.append((archive.name, packs, worlds))
+    try:
+        # Step 4: Process install
+        ui_step(4, "Install", f"Processing {plural(total_archives, 'archive')}.")
+        batch_context = build_archive_batch_context(archives, server_dir)
+        print_archive_batch_overview(batch_context, total_archives)
+        for idx, archive in enumerate(archives, 1):
+            size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
+            print(c_divider(f"Archive {idx}/{total_archives}: {archive.name}"))
+            ui_kv("Size", size_str)
+            packs, worlds = process_archive(archive, server_dir, batch_context)
+            installed.extend(packs)
+            imported_worlds.extend(worlds)
+            archive_results.append((archive.name, packs, worlds))
 
-    if not installed:
-        print(f"\n{c_warn('No RP/BP packs were installed.')}")
-        return
+        if not installed:
+            ui_status("warn", "No RP/BP packs were installed.")
+            return
 
-    # Step 5: Choose target world
-    print(c_divider("Step 5: Choose World"))
-    ui_hint("Packs are installed. Choose a world to enable them in world JSON files.")
-    world_dir = choose_world(server_dir, imported_worlds)
-    print(f"{c_ok(f'World: {world_dir.name}')}")
+        # Step 5: Choose target world
+        ui_step(5, "Choose world", "Installed packs will be enabled in this world.")
+        world_dir = choose_world(server_dir, imported_worlds)
+        ui_status("ok", f"World selected: {world_dir.name}")
 
-    # Step 6: Enable packs in world
-    print(c_divider("Step 6: Enable Packs"))
-    for pack in installed:
-        kind_label = "RP" if pack["kind"] == "rp" else "BP"
-        json_file = "world_resource_packs.json" if pack["kind"] == "rp" else "world_behavior_packs.json"
-        enable_pack(world_dir, pack)
-        pack_name = pack["name"]
-        print(f"  {c_ok(f'[{kind_label}] {pack_name}')} {c_gray('→ ' + json_file)}")
+        # Step 6: Enable packs in world
+        ui_step(6, "Enable packs")
+        for pack in installed:
+            kind_label = "RP" if pack["kind"] == "rp" else "BP"
+            json_file = "world_resource_packs.json" if pack["kind"] == "rp" else "world_behavior_packs.json"
+            path, backup = enable_pack(world_dir, pack)
+            config_changes.append((path, backup))
+            pack_name = pack["name"]
+            ui_status("ok", f"[{kind_label}] {pack_name} -> {json_file}")
 
-    if any(pack["kind"] == "rp" for pack in installed):
-        if not check_texturepack_required(server_dir):
-            if yes_no("\nSet texturepack-required=true so clients automatically download the pack?", True):
-                set_texturepack_required(server_dir)
-                print(f"  {c_ok('texturepack-required=true')}")
+        if any(pack["kind"] == "rp" for pack in installed):
+            if not check_texturepack_required(server_dir):
+                if yes_no("\nSet texturepack-required=true so clients automatically download the pack?", True):
+                    backup = set_texturepack_required(server_dir)
+                    config_changes.append((server_dir / "server.properties", backup))
+                    ui_status("ok", "texturepack-required=true")
 
-    # Step 7: Summary
-    dep_missing = check_dependencies(installed)
-    print_summary(archive_results, dep_missing)
-    print(c_divider())
-    print(f"  {c_green('\U0001F680 Restart bedrock_server to apply changes.')}")
-    print(f"  {c_gray('Backup files (.bak-*) are kept in case you want to restore them.')}")
-    print()
+        # Step 7: Summary
+        ui_step(7, "Summary")
+        dep_missing = check_dependencies(installed, get_installed_addons(server_dir) + installed)
+        print_summary(archive_results, dep_missing)
+        print(c_divider())
+        ui_status("ok", "Restart bedrock_server to apply changes.")
+        ui_kv("Backups", ".temp-addonInstaller/backups/ keeps uninstall backups.")
+        print()
+    except KeyboardInterrupt:
+        rollback_install(installed, imported_worlds, config_changes)
+        raise
+    except Exception:
+        rollback_install(installed, imported_worlds, config_changes)
+        raise
 
 
 
@@ -1538,8 +2198,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{c_yellow('Cancelled.')}")
+        ui_status("warn", "Cancelled.")
     except Exception as e:
-        print(c_err(f"Error: {e}") if _COLOR_ENABLED else f"Error: {e}")
+        ui_status("err", f"Error: {e}")
         log.exception("Fatal error")
         raise SystemExit(1)

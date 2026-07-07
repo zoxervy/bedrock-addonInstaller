@@ -8,8 +8,11 @@ It supports resource packs, behavior packs, combined addons, nested addon archiv
 
 ```text
 bedrock-addonInstaller/
-├─ addonInstaller.py  # main installer script
-└─ README.md          # usage guide and technical notes
+├─ addonInstaller.py       # main installer CLI and interactive flows
+├─ addon_installer/        # shared constants, path helpers, and manifest helpers
+├─ tests/                  # automated safety tests
+├─ README.md               # usage guide and technical notes
+└─ .gitignore              # ignores local logs, temp files, caches, and editor files
 ```
 
 ## Requirements
@@ -57,6 +60,7 @@ Dry-run mode:
 
 - does not fully extract archives
 - reads `manifest.json` directly from the archive when possible
+- scans nested addon archives such as `.mcaddon` files that contain `.mcpack` files
 - simulates destination paths
 - avoids writes, copies, and config updates
 
@@ -93,6 +97,7 @@ The default archive size limit is 500 MB.
 4. Choose action:
    - `1` install addon
    - `2` uninstall addon
+   - `3` reorder world addons
 
 5. Choose addon source:
    - local folder
@@ -154,13 +159,59 @@ It skips:
 - backup folders containing `.bak-`
 - folders without `manifest.json`
 
-Before deleting selected packs, the script requires this confirmation text:
+Before removing selected packs, the script requires this confirmation text:
 
 ```text
 DELETE
 ```
 
-Uninstall also removes pack references from world JSON files.
+By default, uninstall moves addon folders to centralized backups and removes pack references from world JSON files:
+
+```text
+.temp-addonInstaller/backups/<server-name>/bp/
+.temp-addonInstaller/backups/<server-name>/rp/
+```
+
+The uninstall output prints the full backup path for each removed addon.
+Use `--force-delete` to permanently delete addon folders instead.
+
+## Reorder flow
+
+Run:
+
+```bash
+python addonInstaller.py
+```
+
+Then choose:
+
+```text
+3) Reorder world addons
+```
+
+The script lets you choose a world, then choose either behavior packs or resource packs.
+
+Keyboard mode:
+
+- Up/down arrows: move cursor
+- Space: select packs
+- Up/down arrows while packs are selected: move selected packs
+- Enter: save order
+- Confirm commit after saving, or reject/cancel to restore the previous order
+- `a`: select all
+- `c`: clear selection
+- `q`: cancel
+
+Text fallback mode supports:
+
+- `1`
+- `1,3`
+- `u` move selected packs up
+- `d` move selected packs down
+- `a`
+- `c`
+- `q`
+- empty input to save
 
 ## Files modified by install
 
@@ -176,11 +227,15 @@ addonInstaller.log
 .temp-addonInstaller/
 ```
 
-If existing files or folders are replaced, backups use this suffix:
+In `--dry-run` mode, `addonInstaller.log` and `.temp-addonInstaller/` are not written.
+
+If existing files or folders are replaced or removed, backups use this suffix:
 
 ```text
 .bak-YYYYMMDD-HHMMSS
 ```
+
+If install is cancelled or fails after files have already been copied, the installer rolls back copied packs, imported worlds, and config writes.
 
 ## Technical overview
 
@@ -433,7 +488,8 @@ The log records:
 
 ## Current limitations
 
-- Only one CLI option exists: `--dry-run`.
+- CLI options are available for dry-run and force-delete uninstall behavior.
+- Normal uninstall stores backups under `.temp-addonInstaller/backups/<server-name>/bp|rp/`.
 - Most behavior is interactive, not fully scriptable.
 - Server folder must contain the Bedrock binary and `server.properties`.
 - Archive size limit is hardcoded through `MAX_ARCHIVE_MB`.

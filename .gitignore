@@ -1,0 +1,22 @@
+# Runtime logs
+addonInstaller.log
+
+# Installer temp/backups
+.temp-addonInstaller/
+*.bak-*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments
+.venv/
+venv/
+env/
+
+# OS/editor noise
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
