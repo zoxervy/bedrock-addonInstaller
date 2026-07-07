@@ -122,6 +122,8 @@ class AddonInstallerSafetyTests(unittest.TestCase):
                 mock.patch.object(addonInstaller, "extract_archive_to_temp") as extract_mock,
                 mock.patch.object(addonInstaller, "ui_status"),
                 mock.patch.object(addonInstaller, "action"),
+                mock.patch.object(addonInstaller, "ui_phase"),
+                mock.patch.object(addonInstaller, "ui_subitem"),
             ):
                 installed, worlds = addonInstaller.process_archive(archive, server_dir)
 
@@ -131,6 +133,44 @@ class AddonInstallerSafetyTests(unittest.TestCase):
             self.assertEqual(installed[0]["pack_id"], PACK_UUID)
             self.assertEqual(installed[0]["kind"], "rp")
             self.assertFalse((ROOT / ".temp-addonInstaller" / archive.name).exists())
+
+    def test_world_ordered_pack_rows_follow_world_json_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            server_dir = Path(td) / "server"
+            world_dir = server_dir / "worlds" / "Bedrock level"
+            bp_dir = server_dir / "behavior_packs" / "bp_pack"
+            rp_dir = server_dir / "resource_packs" / "rp_pack"
+            world_dir.mkdir(parents=True)
+            bp_dir.mkdir(parents=True)
+            rp_dir.mkdir(parents=True)
+
+            bp_manifest = self.make_manifest(kind="data")
+            bp_manifest["header"]["name"] = "Behavior One"
+            rp_manifest = self.make_manifest(kind="resources")
+            rp_manifest["header"]["uuid"] = OTHER_UUID
+            rp_manifest["header"]["name"] = "Resource One"
+            (bp_dir / "manifest.json").write_text(json.dumps(bp_manifest), encoding="utf-8")
+            (rp_dir / "manifest.json").write_text(json.dumps(rp_manifest), encoding="utf-8")
+            (world_dir / "world_behavior_packs.json").write_text(
+                json.dumps([{"pack_id": PACK_UUID, "version": [1, 0, 0]}]),
+                encoding="utf-8",
+            )
+            (world_dir / "world_resource_packs.json").write_text(
+                json.dumps([{"pack_id": OTHER_UUID, "version": [2, 0, 0]}]),
+                encoding="utf-8",
+            )
+
+            rows = addonInstaller.world_ordered_pack_rows(server_dir, world_dir)
+
+            self.assertEqual([row["kind"] for row in rows], ["bp", "rp"])
+            self.assertEqual([row["name"] for row in rows], ["Behavior One", "Resource One"])
+            self.assertEqual([row["index"] for row in rows], [1, 1])
+
+    def test_pack_content_label_summarizes_pack_kinds(self):
+        self.assertEqual(addonInstaller.pack_content_label(0, 1), "RP only (1)")
+        self.assertEqual(addonInstaller.pack_content_label(1, 0), "BP only (1)")
+        self.assertEqual(addonInstaller.pack_content_label(1, 1), "BP + RP (1 BP, 1 RP)")
+        self.assertEqual(addonInstaller.pack_content_label(0, 0), "no BP/RP packs")
 
     def test_disable_pack_in_world_backs_up_and_removes_pack_ref(self):
         with tempfile.TemporaryDirectory() as td:

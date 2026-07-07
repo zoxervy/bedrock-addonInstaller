@@ -8,12 +8,15 @@ It supports resource packs, behavior packs, combined addons, nested addon archiv
 
 ```text
 bedrock-addonInstaller/
-├─ addonInstaller.py       # main installer CLI and interactive flows
-├─ addon_installer/        # shared constants, path helpers, and manifest helpers
-├─ tests/                  # automated safety tests
-├─ README.md               # usage guide and technical notes
-└─ .gitignore              # ignores local logs, temp files, caches, and editor files
+├─ addonInstaller.py        # standalone installer script; copy this file to use elsewhere
+├─ tests/                   # automated safety tests for development
+├─ .github/workflows/       # GitHub Actions test workflow
+├─ README.md                # usage guide and technical notes
+├─ .gitattributes           # line-ending rules
+└─ .gitignore               # ignores local logs, temp files, caches, and editor files
 ```
+
+Runtime is single-file: copy `addonInstaller.py` by itself if you want to run it from another folder or server.
 
 ## Requirements
 
