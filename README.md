@@ -157,7 +157,7 @@ It skips:
 Before deleting selected packs, the script requires this confirmation text:
 
 ```text
-HAPUS
+DELETE
 ```
 
 Uninstall also removes pack references from world JSON files.
@@ -399,11 +399,13 @@ When enabled, Bedrock clients are forced to download the resource pack when join
 
 ## Logging
 
-The script writes logs to:
+Normal mode writes logs to:
 
 ```text
 addonInstaller.log
 ```
+
+Dry-run mode disables file logging to avoid writes.
 
 The log records:
 
@@ -437,7 +439,6 @@ The log records:
 - Archive size limit is hardcoded through `MAX_ARCHIVE_MB`.
 - Pack dependency handling reports missing dependencies but does not automatically resolve them.
 - Uninstall detection depends on installed pack folders containing `manifest.json`.
-- The UI text inside the script is mostly Indonesian.
 
 ## Safe usage checklist
 
@@ -481,7 +482,7 @@ Also confirm the file extension is supported.
 When asked:
 
 ```text
-Set texturepack-required=true biar client otomatis download pack?
+Set texturepack-required=true so clients automatically download the pack?
 ```
 
 Choose `y`.
