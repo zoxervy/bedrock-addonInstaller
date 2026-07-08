@@ -8,15 +8,11 @@ It supports resource packs, behavior packs, combined addons, nested addon archiv
 
 ```text
 bedrock-addonInstaller/
-├─ addonInstaller.py        # standalone installer script; copy this file to use elsewhere
-├─ tests/                   # automated safety tests for development
-├─ .github/workflows/       # GitHub Actions test workflow
-├─ README.md                # usage guide and technical notes
-├─ .gitattributes           # line-ending rules
-└─ .gitignore               # ignores local logs, temp files, caches, and editor files
+├─ app.py       # standalone installer script; copy this file to use elsewhere
+└─ README.md    # usage guide and technical notes
 ```
 
-Runtime is single-file: copy `addonInstaller.py` by itself if you want to run it from another folder or server.
+Runtime is single-file: copy `app.py` by itself if you want to run it from another folder or server.
 
 ## Requirements
 
@@ -42,13 +38,13 @@ py --version
 Run from this folder:
 
 ```bash
-python addonInstaller.py
+python app.py
 ```
 
 Or on Windows:
 
 ```bash
-py addonInstaller.py
+py app.py
 ```
 
 ## Dry-run mode
@@ -56,7 +52,7 @@ py addonInstaller.py
 Preview actions without writing files:
 
 ```bash
-python addonInstaller.py --dry-run
+python app.py --dry-run
 ```
 
 Dry-run mode:
@@ -89,28 +85,60 @@ The default archive size limit is 500 MB.
 2. Run:
 
    ```bash
-   python addonInstaller.py
+   python app.py
    ```
 
 3. Choose the Bedrock server folder:
    - `1` use current folder
    - `2` list subfolders
    - `3` enter manual path
+   - `0` exit
 
 4. Choose action:
    - `1` install addon
    - `2` uninstall addon
    - `3` reorder world addons
+   - `0` exit
 
 5. Choose addon source:
    - local folder
    - server folder
    - manual folder path
    - manual file path
+   - `0` exit
 
 6. Select addons.
-7. Choose target world.
-8. Restart `bedrock_server` after installation.
+7. Review the conflict scanner report.
+8. Choose target world.
+9. Restart `bedrock_server` after installation.
+
+## Cancel controls
+
+Most prompts support:
+
+- `Ctrl+C` cancel current flow
+- `0` exit where shown
+- `q`, `quit`, `exit`, `cancel`, or `x` cancel where text input is accepted
+
+If install is cancelled after files were copied, the installer rolls back copied packs, imported worlds, and config writes.
+
+## Conflict scanner
+
+Before copying packs, the installer pre-scans selected archives and reports possible conflicts:
+
+- same pack UUID already installed
+- selected version differs from installed version
+- same pack UUID selected more than once in the batch
+- destination pack folder already exists
+
+If conflicts are found, choose:
+
+```text
+1) Continue
+0) Cancel install
+```
+
+Continuing keeps the existing safety prompts before any replacement happens.
 
 ## Interactive addon picker
 
@@ -142,7 +170,7 @@ This fallback is useful when the terminal does not support raw keyboard input.
 Run:
 
 ```bash
-python addonInstaller.py
+python app.py
 ```
 
 Then choose:
@@ -183,7 +211,7 @@ Use `--force-delete` to permanently delete addon folders instead.
 Run:
 
 ```bash
-python addonInstaller.py
+python app.py
 ```
 
 Then choose:
@@ -217,6 +245,8 @@ Text fallback mode supports:
 - empty input to save
 
 ## Files modified by install
+
+Before these writes, the conflict scanner warns about duplicate UUIDs, version changes, duplicate selected packs, and existing destination folders.
 
 The script may create or modify:
 
@@ -252,6 +282,7 @@ Main flow:
    - choose addon source location
    - scan supported archives
    - allow multi-select
+   - pre-scan conflicts before copying files
    - validate each archive
    - extract archive safely
    - process nested archives
@@ -283,7 +314,7 @@ It can run from:
 
 ```text
 project/
-├─ addonInstaller.py
+├─ app.py
 ├─ .addons/
 │  ├─ addon-one.mcaddon
 │  └─ addon-two.mcpack
@@ -296,7 +327,7 @@ Or directly inside a Bedrock server folder:
 
 ```text
 bedrock-server/
-├─ addonInstaller.py
+├─ app.py
 ├─ bedrock_server.exe
 ├─ server.properties
 └─ incoming-addons/
@@ -485,6 +516,7 @@ The log records:
 - Blocks unsafe TAR links.
 - Validates UUID format.
 - Backs up existing files before replacement.
+- Warns about install conflicts before copying files.
 - Avoids duplicate world pack entries.
 - Can import worlds/templates.
 - Can uninstall user-installed packs.
@@ -507,7 +539,7 @@ Before installing:
 2. Run:
 
    ```bash
-   python addonInstaller.py --dry-run
+   python app.py --dry-run
    ```
 
 3. Confirm the detected RP/BP names.
@@ -515,7 +547,7 @@ Before installing:
 5. Install normally:
 
    ```bash
-   python addonInstaller.py
+   python app.py
    ```
 
 6. Backup important worlds manually if the server is production.

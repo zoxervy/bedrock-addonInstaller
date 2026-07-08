@@ -403,26 +403,49 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
         sys.stdout.flush()
 
 
-def ask(prompt, default=None):
+class UserExit(KeyboardInterrupt):
+    """Raised when the user chooses an explicit exit/cancel option."""
+
+
+EXIT_CHOICES = {"0", "q", "quit", "exit", "cancel", "x"}
+
+
+def is_exit_choice(value) -> bool:
+    return str(value or "").strip().lower() in EXIT_CHOICES
+
+
+def raise_if_exit(value) -> None:
+    if is_exit_choice(value):
+        raise UserExit
+
+
+def ask(prompt, default=None, allow_exit=True):
     suffix = f" [{default}]" if default else ""
     try:
         value = input(f"  {prompt}{suffix}: ").strip()
     except EOFError:
-        raise KeyboardInterrupt
+        raise UserExit
+    if value and allow_exit:
+        raise_if_exit(value)
     return value or default
 
 
-def yes_no(prompt, default=True):
-    d = "Y/n" if default else "y/N"
+def yes_no(prompt, default=True, allow_exit=True):
+    d = "Y/n/q" if default else "y/N/q"
     while True:
-        value = input(f"{prompt} [{d}]: ").strip().lower()
+        try:
+            value = input(f"{prompt} [{d}]: ").strip().lower()
+        except EOFError:
+            raise UserExit
+        if value and allow_exit:
+            raise_if_exit(value)
         if not value:
             return default
         if value in ("y", "yes"):
             return True
         if value in ("n", "no"):
             return False
-        print("Answer y/n.")
+        print("Answer y/n, or q to cancel.")
 
 
 def action(text: str) -> None:
@@ -536,6 +559,7 @@ def choose_server_dir():
         ui_option("1", "Use current folder", f"{current.name}/")
         ui_option("2", "Browse folders here")
         ui_option("3", "Enter custom path")
+        ui_option("0", "Exit")
         choice = ask("Select option", "1")
 
         try:
@@ -563,7 +587,7 @@ def choose_server_dir():
                 manual = ask("Bedrock server folder path", str(current))
                 server_dir = Path(manual).expanduser().resolve()
             else:
-                ui_status("warn", "Choice must be 1, 2, or 3.")
+                ui_status("warn", "Choice must be 0, 1, 2, or 3.")
                 continue
 
             if not server_dir.exists():
@@ -900,6 +924,7 @@ def choose_archive_location(server_dir):
         ui_option("1", "Browse project folders", f"{cwd.name}/")
         ui_option("2", "Scan server folder", f"{server_dir.name}/")
         ui_option("3", "Enter custom folder or file")
+        ui_option("0", "Exit")
         choice = ask("Select option", "1")
 
         if choice == "1":
@@ -943,7 +968,7 @@ def choose_archive_location(server_dir):
                 continue
             return path
 
-        ui_status("warn", "Choose 1, 2, or 3.")
+        ui_status("warn", "Choose 0, 1, 2, or 3.")
 
 
 def get_key():
@@ -1136,9 +1161,11 @@ def choose_archives_text(candidates, search_dirs, server_dir):
             print(f"  [{mark}] {i}. {path.name} {folder}{suffix}")
         print()
         ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
-        ui_kv("Shortcuts", "a all · c clear · r refresh · 0 add file · Enter continue")
+        ui_kv("Shortcuts", "a all · c clear · r refresh · 0 add file · q exit · Enter continue")
 
-        choice = ask("Choose addon/template", "")
+        choice = ask("Choose addon/template", "", allow_exit=False)
+        if is_exit_choice(choice) and choice != "0":
+            raise UserExit
         if choice == "":
             break
         if choice.lower() == "a":
@@ -1406,6 +1433,18 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     return installed
 
 
+def format_version(version) -> str:
+    if isinstance(version, list):
+        return ".".join(map(str, version))
+    if version is None:
+        return "unknown"
+    return str(version)
+
+
+def kind_name(kind: str) -> str:
+    return "Resource Pack" if kind == "rp" else "Behavior Pack"
+
+
 def build_archive_batch_context(archives, server_dir):
     """Inspect selected archives so Step 4 can explain split BP/RP installs."""
     archive_items = {}
@@ -1449,6 +1488,144 @@ def build_archive_batch_context(archives, server_dir):
         "rp_count": rp_count,
         "dependencies": dependencies,
     }
+
+
+def installed_pack_index(server_dir):
+    """Build lookups for installed packs by UUID/kind and folder name."""
+    by_key = {}
+    by_folder = {}
+    for pack in get_installed_addons(server_dir):
+        pack_id = pack.get("pack_id")
+        kind = pack.get("kind")
+        path = pack.get("path")
+        if pack_id and kind:
+            by_key[(pack_id, kind)] = pack
+        if path:
+            by_folder[Path(path).name.lower()] = pack
+    return {"by_key": by_key, "by_folder": by_folder}
+
+
+def _virtual_pack_dir(archive: Path, manifest_name: str) -> Path:
+    label = str(manifest_name).split("!", 1)[-1]
+    parent = Path(label).parent
+    if str(parent) in ("", "."):
+        return Path(archive.stem)
+    return parent
+
+
+def manifest_pack_records(archive: Path, manifest_items, server_dir: Path):
+    """Convert pre-scanned manifest items into per-kind install records."""
+    records = []
+    for manifest_name, manifest in manifest_items:
+        header = manifest.get("header", {})
+        pack_id = header.get("uuid")
+        kinds = detect_pack_kinds(manifest)
+        if not pack_id or not kinds:
+            continue
+        try:
+            version = version_array(header.get("version"))
+        except Exception:
+            version = header.get("version")
+        pack_dir = _virtual_pack_dir(archive, str(manifest_name))
+        pack_name = manifest_display_name(pack_dir, manifest)
+        for kind in kinds:
+            base = server_dir / ("resource_packs" if kind == "rp" else "behavior_packs")
+            dest = base / pack_folder_name(pack_dir, manifest, kind)
+            records.append({
+                "archive": archive,
+                "manifest_name": str(manifest_name),
+                "name": pack_name,
+                "pack_id": pack_id,
+                "version": version,
+                "kind": kind,
+                "dest": dest,
+            })
+    return records
+
+
+def scan_install_conflicts(archives, server_dir, batch_context):
+    """Detect install conflicts before extraction/copy starts."""
+    index = installed_pack_index(server_dir)
+    conflicts = []
+    seen = {}
+    archive_items = batch_context.get("archive_items", {})
+
+    for archive in archives:
+        archive_path = Path(archive).expanduser().resolve()
+        records = manifest_pack_records(archive_path, archive_items.get(archive_path, []), server_dir)
+        for record in records:
+            key = (record["pack_id"], record["kind"])
+            installed_pack = index["by_key"].get(key)
+            if installed_pack:
+                conflicts.append({
+                    "type": "installed_uuid",
+                    "record": record,
+                    "installed": installed_pack,
+                })
+                if installed_pack.get("version") != record.get("version"):
+                    conflicts.append({
+                        "type": "version_change",
+                        "record": record,
+                        "installed": installed_pack,
+                    })
+
+            previous = seen.get(key)
+            if previous:
+                conflicts.append({
+                    "type": "batch_duplicate_uuid",
+                    "record": record,
+                    "previous": previous,
+                })
+            else:
+                seen[key] = record
+
+            dest = record["dest"]
+            if dest.exists():
+                conflicts.append({
+                    "type": "dest_exists",
+                    "record": record,
+                    "installed": index["by_folder"].get(dest.name.lower()),
+                })
+    return conflicts
+
+
+def print_install_conflicts(conflicts) -> None:
+    if not conflicts:
+        ui_status("ok", "No install conflicts found.")
+        return
+
+    print(c_divider("Install conflicts"))
+    ui_status("warn", f"Found {plural(len(conflicts), 'possible conflict')} before copying files.")
+    for idx, conflict in enumerate(conflicts, 1):
+        record = conflict["record"]
+        installed = conflict.get("installed") or {}
+        kind = "RP" if record["kind"] == "rp" else "BP"
+        print(f"\n  {idx}. {c_bold(record['name'])} {c_gray(f'[{kind}]')}")
+        ui_kv("  Type", conflict["type"].replace("_", " "))
+        ui_kv("  UUID", record["pack_id"])
+        ui_kv("  Archive", record["archive"].name)
+        ui_kv("  Selected", f"v{format_version(record.get('version'))} -> {short_path(record['dest'])}")
+        if installed:
+            ui_kv("  Installed", f"v{format_version(installed.get('version'))} -> {short_path(installed.get('path'))}")
+        previous = conflict.get("previous")
+        if previous:
+            ui_kv("  Previous", f"{previous['archive'].name} -> {short_path(previous['dest'])}")
+
+
+def confirm_install_conflicts(conflicts) -> bool:
+    """Return True to continue after conflict report, False to cancel."""
+    if not conflicts:
+        return True
+    print()
+    ui_option("1", "Continue", "keep safety prompts before replacing files")
+    ui_option("0", "Cancel install")
+    while True:
+        choice = ask("Conflict action", "0", allow_exit=False)
+        if is_exit_choice(choice):
+            return False
+        if choice == "1":
+            return True
+        ui_status("warn", "Choose 1 to continue or 0 to cancel.")
 
 
 def print_archive_batch_overview(context, archive_count) -> None:
@@ -1663,9 +1840,12 @@ def choose_world(server_dir, imported_worlds):
         for i, w in enumerate(existing, 1):
             ui_option(str(i), w.name)
         ui_option("0", "Create/use another name")
+        ui_kv("Shortcuts", "q/exit cancel")
         # Handle non-integer input without crashing
         while True:
-            choice = ask("Choose world", "1")
+            choice = ask("Choose world", "1", allow_exit=False)
+            if is_exit_choice(choice) and choice != "0":
+                raise UserExit
             try:
                 idx = int(choice)
                 if idx == 0:
@@ -1704,6 +1884,7 @@ def choose_existing_world(server_dir):
     print(c_divider("Choose world"))
     for i, world in enumerate(existing, 1):
         ui_option(str(i), world.name)
+    ui_option("0", "Exit")
     while True:
         raw = ask("Choose world", "1")
         try:
@@ -1813,6 +1994,7 @@ def get_installed_addons(server_dir):
                     "path": pack_dir,
                     "name": manifest_display_name(pack_dir, manifest),
                     "pack_id": header.get("uuid"),
+                    "version": version_array(header.get("version")),
                     "kind": kind
                 })
             except Exception as e:
@@ -2352,12 +2534,16 @@ def main():
         ui_option("1", "Install addon", "copy packs and enable them in a world")
         ui_option("2", "Uninstall addon", "remove world refs and back up pack folders")
         ui_option("3", "Reorder world addons", "adjust BP/RP load order")
+        ui_option("0", "Exit")
         print_installed_addon_overview(server_dir, default_world_dir(server_dir))
         while True:
-            action_choice = ask("Choose action", "1")
+            action_choice = ask("Choose action", "1", allow_exit=False)
+            if is_exit_choice(action_choice):
+                ui_status("warn", "Cancelled.")
+                return
             if action_choice in ("1", "2", "3"):
                 break
-            ui_status("warn", "Choose 1, 2, or 3.")
+            ui_status("warn", "Choose 0, 1, 2, or 3.")
 
         if action_choice == "2":
             print(c_divider("Uninstall addon"))
@@ -2390,6 +2576,11 @@ def main():
         ui_step(4, "Install", f"Processing {plural(total_archives, 'archive')}.")
         batch_context = build_archive_batch_context(archives, server_dir)
         print_archive_batch_overview(batch_context, total_archives)
+        conflicts = scan_install_conflicts(archives, server_dir, batch_context)
+        print_install_conflicts(conflicts)
+        if not confirm_install_conflicts(conflicts):
+            ui_status("warn", "Install cancelled before files were copied.")
+            return
         for idx, archive in enumerate(archives, 1):
             size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
             print(c_divider(f"Archive {idx}/{total_archives}: {archive.name}"))
