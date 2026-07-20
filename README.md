@@ -47,6 +47,23 @@ Or on Windows:
 py app.py
 ```
 
+## Inspect addon
+
+Inspect an addon archive without installing it or choosing a server:
+
+```bash
+python app.py --inspect path/to/addon.mcaddon
+```
+
+Inspect mode:
+
+- does not extract, copy, or write files
+- reads `manifest.json` directly from the archive when possible
+- scans nested addon archives such as `.mcaddon` files that contain `.mcpack` files
+- prints detected BP/RP type, pack UUID, version, manifest source, and dependencies
+
+Use this to check unknown addons before dry-run or install.
+
 ## Dry-run mode
 
 Preview actions without writing files:
@@ -344,7 +361,7 @@ A folder is treated as a Bedrock server only if it contains:
 - `bedrock_server.exe` on Windows
 - `bedrock_server` on Linux/macOS
 
-Validation happens before install or uninstall actions continue.
+Validation happens before install or uninstall actions continue. After a server is selected, the installer shows server info including folder, binary name, detected Bedrock server version when available, and configured level name.
 
 ## Archive validation
 
@@ -452,9 +469,11 @@ A folder is treated as a world when it contains:
 On import:
 
 1. Read `levelname.txt` if available.
-2. Ask the user to confirm or edit the world name.
-3. Validate the world name to prevent path traversal.
-4. Copy the world folder into `worlds/<world-name>/`.
+2. Choose whether to create a new independent world or replace an existing world.
+3. For a new world, ask for a new folder name and refuse names that already exist.
+4. For replacement, warn that the existing world progress will be overwritten and create a backup first.
+5. After creating a new world, ask whether to update `server.properties` `level-name` to that new world or leave it for manual setup.
+6. Show imported world action, backup, and `server.properties` status in the final summary.
 
 ## World pack activation
 

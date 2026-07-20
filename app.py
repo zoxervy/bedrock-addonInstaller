@@ -90,8 +90,12 @@ def version_array(version):
     return result
 
 
+def manifest_module_types(manifest):
+    return [str(m.get("type", "unknown")) for m in manifest.get("modules", [])]
+
+
 def detect_pack_kinds(manifest):
-    types = [m.get("type") for m in manifest.get("modules", [])]
+    types = manifest_module_types(manifest)
     kinds = []
     if "resources" in types:
         kinds.append("rp")
@@ -100,9 +104,52 @@ def detect_pack_kinds(manifest):
     return kinds
 
 
+def manifest_kind_label(manifest) -> str:
+    labels = [kind_name(kind) for kind in detect_pack_kinds(manifest)]
+    types = manifest_module_types(manifest)
+    if "world_template" in types:
+        labels.append("World Template")
+    return ", ".join(labels) if labels else "Unknown"
+
+
+def strip_bedrock_formatting(text: str) -> str:
+    """Remove Minecraft formatting codes such as §l and §6 from display names."""
+    return re.sub(r"§.", "", str(text or ""))
+
+
 def clean_name(name):
-    cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in name).strip()
+    cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in strip_bedrock_formatting(name)).strip()
     return cleaned.replace(" ", "_") or "pack"
+
+
+def clean_pack_title(name: str) -> str:
+    """Return a readable pack title without color codes, version text, or BP/RP suffixes."""
+    text = strip_bedrock_formatting(name).replace("_", " ")
+    text = re.sub(r"[\[\(]\s*(bp|rp|resource|resources|behavior|behaviour|texture|textures|addon|add-on|pack|world)\s*[\]\)]", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(resource|resources|behavior|behaviour|texture|textures)\s+pack\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\badd-?on\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:\s*[-–—|:]\s*)?\b(bp|rp|resource|resources|behavior|behaviour|texture|textures)\s+(\d+)\b", r" \2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bv?\d+(?:\.\d+){1,3}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:\s*[-–—|:]\s*)?\b(bp|rp|resource|resources|behavior|behaviour|texture|textures|world)\b\s*", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" -–—_|:")
+    return text or "Pack"
+
+
+def safe_folder_component(name: str) -> str:
+    """Sanitize a readable folder name without turning spaces into underscores."""
+    cleaned = "".join(c if c.isalnum() or c in " ._-&()[]" else " " for c in strip_bedrock_formatting(name))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._-&")
+    return cleaned or "Pack"
+
+
+def manifest_version_label(manifest: dict) -> str:
+    try:
+        version = version_array(manifest.get("header", {}).get("version"))
+        while len(version) > 1 and version[-1] == 0:
+            version.pop()
+        return format_version(version)
+    except Exception:
+        return format_version(manifest.get("header", {}).get("version"))
 
 
 def read_lang_entries(path: Path) -> dict:
@@ -174,13 +221,56 @@ def manifest_display_name(pack_dir: Path, manifest: dict) -> str:
 
 
 def pack_folder_name(pack_dir, manifest, kind=None):
-    header = manifest.get("header", {})
-    name = manifest_display_name(Path(pack_dir), manifest)
-    uuid = header.get("uuid", "")[:8]
-    base = f"{clean_name(name)}_{uuid}" if uuid else clean_name(name)
+    name = clean_pack_title(manifest_display_name(Path(pack_dir), manifest))
+    version = manifest_version_label(manifest)
+    suffix = f" v{version}" if version != "unknown" else ""
     if kind in ("rp", "bp"):
-        return f"{base}-{'RP' if kind == 'rp' else 'BP'}"
-    return base
+        return safe_folder_component(f"{name}{suffix} {kind.upper()}")
+    return safe_folder_component(f"{name}{suffix}")
+
+
+def unique_world_pack_folder(base: Path, desired_name: str, current: Path) -> Path:
+    """Return a local world pack folder path that does not collide."""
+    candidate = safe_child_path(base, desired_name, desired_name)
+    if candidate.resolve() == current.resolve() or not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        candidate_name = f"{desired_name}-{index}"
+        candidate = safe_child_path(base, candidate_name, candidate_name)
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def normalize_world_local_pack_folders(world_dir: Path):
+    """Rename imported world-local BP/RP folders from generic bp0/rp0 to readable pack names."""
+    if DRY_RUN:
+        return []
+    renamed = []
+    for kind, folder_name in (("bp", "behavior_packs"), ("rp", "resource_packs")):
+        base = world_dir / folder_name
+        if not base.exists():
+            continue
+        for pack_dir in sorted([p for p in base.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+            manifest_path = pack_dir / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = load_json(manifest_path)
+            except Exception as e:
+                log.warning("Cannot read world-local pack manifest %s: %s", manifest_path, e)
+                continue
+            if kind not in detect_pack_kinds(manifest):
+                continue
+            desired_name = pack_folder_name(pack_dir, manifest, kind)
+            dest = unique_world_pack_folder(base, desired_name, pack_dir)
+            if dest.resolve() == pack_dir.resolve():
+                continue
+            log.info("Rename world-local pack folder: %s -> %s", pack_dir, dest)
+            pack_dir.rename(dest)
+            renamed.append({"kind": kind, "old": pack_dir.name, "new": dest.name})
+    return renamed
 
 
 def manifest_dependencies(manifest):
@@ -289,54 +379,169 @@ def c_green(t: str)  -> str: return _c("92", t)
 def c_yellow(t: str) -> str: return _c("93", t)
 def c_red(t: str)    -> str: return _c("91", t)
 def c_cyan(t: str)   -> str: return _c("96", t)
+def c_blue(t: str)   -> str: return _c("94", t)
+def c_magenta(t: str)-> str: return _c("95", t)
 def c_bold(t: str)   -> str: return _c("1",  t)
 def c_gray(t: str)   -> str: return _c("90", t)
-def c_ok(t: str)     -> str: return c_green(f"\u2713 {t}")
-def c_warn(t: str)   -> str: return c_yellow(f"\u26a0 {t}")
-def c_err(t: str)    -> str: return c_red(f"\u2717 {t}")
-def c_info(t: str)   -> str: return c_cyan(f"\u2192 {t}")
+def c_ok(t: str)     -> str: return c_green(f"✓ {t}")
+def c_warn(t: str)   -> str: return c_yellow(f"⚠ {t}")
+def c_err(t: str)    -> str: return c_red(f"✗ {t}")
+def c_info(t: str)   -> str: return c_cyan(f"→ {t}")
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", str(text))
+
+
+def display_len(text) -> int:
+    return len(strip_ansi(str(text)))
+
+
+def terminal_width(default: int = 88) -> int:
+    return max(60, min(110, shutil.get_terminal_size((default, 20)).columns))
+
+
+def clip_text(text, max_len: int) -> str:
+    text = str(text)
+    if display_len(text) <= max_len:
+        return text
+    plain = strip_ansi(text)
+    return plain[:max(0, max_len - 1)] + "…"
+
+
+def pad_ansi(text, width: int) -> str:
+    return str(text) + " " * max(0, width - display_len(text))
+
+
+def ui_badge(text: str, kind: str = "info") -> str:
+    label = f" {str(text).strip()} "
+    if kind in ("ok", "success"):
+        return c_green(f"[{label}]")
+    if kind in ("warn", "warning"):
+        return c_yellow(f"[{label}]")
+    if kind in ("err", "error", "danger"):
+        return c_red(f"[{label}]")
+    if kind == "muted":
+        return c_gray(f"[{label}]")
+    if kind == "accent":
+        return c_magenta(f"[{label}]")
+    return c_cyan(f"[{label}]")
+
+
+def ui_rule(title: str = "") -> str:
+    width = terminal_width()
+    if not title:
+        return c_gray("─" * width)
+    line_len = max(8, width - display_len(title) - 4)
+    return f"{c_bold(title)} {c_gray('─' * line_len)}"
+
+
 def c_divider(t: str = "") -> str:
-    line = "\u2500" * 72
-    return c_gray(f"\n{line}") if not t else f"\n{c_bold(t)}\n{c_gray(line)}"
+    return f"\n{ui_rule(t)}"
+
+
+def ui_panel(title: str, rows=None, subtitle: str = "", kind: str = "info") -> None:
+    rows = rows or []
+    width = terminal_width()
+    border_color = {"ok": c_green, "warn": c_yellow, "err": c_red, "danger": c_red}.get(kind, c_cyan)
+    print(border_color("╭" + "─" * (width - 2) + "╮"))
+    print(border_color("│") + pad_ansi(f" {c_bold(title)}", width - 2) + border_color("│"))
+    if subtitle:
+        print(border_color("│") + pad_ansi(f" {c_gray(clip_text(subtitle, width - 4))}", width - 2) + border_color("│"))
+    if rows:
+        print(border_color("├" + "─" * (width - 2) + "┤"))
+    for row in rows:
+        if isinstance(row, tuple):
+            label, value = row
+            content = f" {c_gray(str(label) + ':')} {value}"
+        else:
+            content = f" {row}"
+        content = clip_text(content, width - 4)
+        print(border_color("│") + pad_ansi(content, width - 2) + border_color("│"))
+    print(border_color("╰" + "─" * (width - 2) + "╯"))
+
 
 def ui_step(number: int, title: str, note: str = "") -> None:
     """Print a consistent step header."""
-    print(c_divider(f"Step {number}: {title}"))
+    print()
+    print(f"{ui_badge(f'STEP {number}', 'accent')} {c_bold(title)}")
     if note:
-        print(c_gray(f"  {note}"))
+        print(f"  {c_gray(note)}")
+    else:
+        print(f"  {c_gray('─' * max(12, terminal_width() - 4))}")
+
 
 def ui_kv(label: str, value) -> None:
-    """Print aligned key/value rows for readable metadata."""
-    print(f"  {c_gray((label + ':').ljust(15))} {value}")
+    """Print compact key/value rows for readable metadata."""
+    print(f"  {c_gray(str(label) + ':')} {value}")
+
 
 def ui_option(number: str, label: str, hint: str = "") -> None:
     """Print a numbered menu option."""
-    suffix = f" {c_gray(hint)}" if hint else ""
-    print(f"  {c_cyan(number.rjust(2))}) {label}{suffix}")
+    key_kind = "danger" if str(number) == "0" else "info"
+    key = ui_badge(str(number), key_kind)
+    suffix = f"  {c_gray(hint)}" if hint else ""
+    print(f"  {key} {label}{suffix}")
+
 
 def ui_status(kind: str, text: str) -> None:
     """Print a high-signal status line."""
-    if kind == "ok":
-        print(f"  {c_ok(text)}")
-    elif kind == "warn":
-        print(f"  {c_warn(text)}")
-    elif kind == "err":
-        print(f"  {c_err(text)}")
-    else:
-        print(f"  {c_info(text)}")
+    badge_map = {"ok": "OK", "warn": "WARN", "err": "ERROR", "info": "INFO"}
+    badge_kind = {"ok": "ok", "warn": "warn", "err": "danger", "info": "info"}.get(kind, "info")
+    print(f"  {ui_badge(badge_map.get(kind, 'INFO'), badge_kind)} {text}")
 
 
 def ui_phase(label: str, detail: str = "") -> None:
     """Print an archive processing phase."""
     suffix = f" {c_gray(detail)}" if detail else ""
-    print(f"\n  {c_cyan('•')} {c_bold(label)}{suffix}")
+    print(f"\n  {ui_badge('PHASE', 'accent')} {c_bold(label)}{suffix}")
 
 
 def ui_subitem(label: str, value: str = "") -> None:
     """Print an indented detail row inside a phase."""
     suffix = f" {value}" if value else ""
-    print(f"    {label}{suffix}")
+    print(f"    {c_gray('•')} {label}{suffix}")
 
+
+def ui_help(*items: str) -> None:
+    print(f"  {c_gray(' · '.join(items))}")
+
+
+def ui_pause(prompt: str = "Press Enter to continue...") -> None:
+    input(f"  {c_gray(prompt)}")
+
+
+def ui_checkbox_row(index: int, text: str, selected: bool = False, cursor: bool = False, hint: str = "", order: Optional[int] = None) -> None:
+    order_prefix = f"{order:<2}" if order is not None else "  "
+    pointer = c_cyan("›") if cursor else " "
+    check = c_green("[✓]") if selected else c_gray("[ ]")
+    number = ui_badge(str(index), "muted")
+    row_text = c_bold(text) if cursor else text
+    suffix = ""
+    if hint:
+        clean_hint = strip_ansi(hint)
+        lowered = clean_hint.lower()
+        if "already installed" in lowered:
+            clean_hint = clean_hint.replace("(already installed)", "").strip()
+            suffix = f" {c_gray(clean_hint)} {ui_badge('INSTALLED', 'warn')}"
+        elif "partially installed" in lowered:
+            clean_hint = clean_hint.replace("(partially installed)", "").strip()
+            suffix = f" {c_gray(clean_hint)} {ui_badge('PARTIAL', 'warn')}"
+        else:
+            suffix = f" {c_gray(clean_hint)}"
+    line = f"  {order_prefix}{pointer} {check} {number} {row_text}{suffix}"
+    if cursor:
+        print(_c("7", pad_ansi(strip_ansi(line), terminal_width() - 2)))
+    else:
+        print(line)
+
+
+def ui_menu(title: str, rows=None, subtitle: str = "") -> None:
+    print(c_divider(title))
+    if subtitle:
+        print(f"  {c_gray(subtitle)}")
+    for row in rows or []:
+        ui_kv(*row)
 
 def short_path(path, max_len: int = 72) -> str:
     """Return a compact path for console output."""
@@ -363,24 +568,25 @@ def plural(count: int, singular: str, plural_word=None) -> str:
 
 def ui_banner(log_file, force_delete=False) -> None:
     """Print the app banner and current runtime mode."""
-    width = 72
-    title = "Bedrock Addon Installer"
-    subtitle = "Install, enable, reorder, and remove Minecraft Bedrock addons"
-    print()
-    print(c_cyan("╔" + "═" * width + "╗"))
-    print(c_cyan("║") + c_bold(f" {title}".ljust(width)) + c_cyan("║"))
-    print(c_cyan("║") + c_gray(f" {subtitle}".ljust(width)) + c_cyan("║"))
-    print(c_cyan("╚" + "═" * width + "╝"))
-    ui_kv("Author", "@zoxervy")
-    ui_kv("Safety", "Backups before overwrite · safe archive extraction")
-    if log_file:
-        ui_kv("Log", log_file.resolve())
-    else:
-        ui_kv("Log", "disabled in dry-run mode")
+    rows = [
+        ("Author", "@zoxervy"),
+        ("Safety", "Backups before overwrite · safe archive extraction"),
+        ("Log", log_file.resolve() if log_file else "disabled in dry-run mode"),
+    ]
+    modes = []
     if DRY_RUN:
-        ui_kv("Mode", c_yellow("DRY-RUN (no file writes)"))
+        modes.append(ui_badge("DRY-RUN", "warn"))
     if force_delete:
-        ui_kv("Uninstall", c_red("force-delete enabled"))
+        modes.append(ui_badge("FORCE DELETE", "danger"))
+    if modes:
+        rows.append(("Mode", " ".join(modes)))
+    print()
+    ui_panel(
+        "Bedrock Addon Installer",
+        rows,
+        "Install, enable, reorder, and remove Minecraft Bedrock addons",
+        "warn" if force_delete else "info",
+    )
 
 
 # ── Progress bar ─────────────────────────────────────────────────────────────
@@ -388,15 +594,19 @@ def print_progress(current: int, total: int, label: str = "", bar_width: int = 2
     """Show a progress bar on the same line using carriage-return overwrite."""
     if total == 0:
         return
-    pct  = current / total
+    width = terminal_width()
+    suffix_width = 34 if show_label and label else 18
+    bar_width = max(12, min(bar_width, width - suffix_width))
+    pct = current / total
     done = int(bar_width * pct)
-    bar  = "\u2588" * done + "\u2591" * (bar_width - done)  # filled and empty blocks
-    bar_str   = c_cyan(bar) if _COLOR_ENABLED else bar
+    bar = "\u2588" * done + "\u2591" * (bar_width - done)
+    bar_str = c_cyan(bar) if _COLOR_ENABLED else bar
     suffix = ""
     if show_label and label:
-        label_str = (label[:22] + "\u2026") if len(label) > 23 else label.ljust(23)
+        label_str = clip_text(label, max(12, width - bar_width - 24))
         suffix = f" {c_gray(label_str) if _COLOR_ENABLED else label_str}"
-    sys.stdout.write(f"\r    [{bar_str}] {pct:5.1%} ({current}/{total}){suffix}")
+    line = f"    {ui_badge('WORK', 'accent')} [{bar_str}] {pct:5.1%} ({current}/{total}){suffix}"
+    sys.stdout.write("\r" + line + " " * max(0, width - display_len(line)))
     sys.stdout.flush()
     if current >= total:
         sys.stdout.write("\n")
@@ -420,7 +630,7 @@ def raise_if_exit(value) -> None:
 
 
 def ask(prompt, default=None, allow_exit=True):
-    suffix = f" [{default}]" if default else ""
+    suffix = f" {c_gray('[' + str(default) + ']')}" if default else ""
     try:
         value = input(f"  {prompt}{suffix}: ").strip()
     except EOFError:
@@ -434,7 +644,7 @@ def yes_no(prompt, default=True, allow_exit=True):
     d = "Y/n/q" if default else "y/N/q"
     while True:
         try:
-            value = input(f"{prompt} [{d}]: ").strip().lower()
+            value = input(f"  {prompt} {c_gray('[' + d + ']')}: ").strip().lower()
         except EOFError:
             raise UserExit
         if value and allow_exit:
@@ -445,14 +655,14 @@ def yes_no(prompt, default=True, allow_exit=True):
             return True
         if value in ("n", "no"):
             return False
-        print("Answer y/n, or q to cancel.")
+        ui_status("warn", "Answer y/n, or q to cancel.")
 
 
 def action(text: str) -> None:
     if DRY_RUN:
-        msg = c_yellow(f"[DRY-RUN] {text}")
+        msg = f"  {ui_badge('DRY-RUN', 'warn')} {text}"
     else:
-        msg = c_info(text) if _COLOR_ENABLED else text
+        msg = f"  {ui_badge('INFO', 'info')} {text}" if _COLOR_ENABLED else text
     print(msg)
     log.info(text)
 
@@ -461,14 +671,65 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def find_server_root_for_path(path: Path) -> Optional[Path]:
+    """Find the nearest Bedrock server root for a path being backed up."""
+    start = path if path.is_dir() else path.parent
+    for candidate in [start, *start.parents]:
+        if (candidate / "server.properties").exists() or (candidate / server_binary_name()).exists():
+            return candidate
+    return None
+
+
+def backup_category_for_path(path: Path, server_dir: Optional[Path]) -> str:
+    if server_dir:
+        try:
+            first = path.resolve().relative_to(server_dir.resolve()).parts[0].lower()
+        except (ValueError, IndexError):
+            first = ""
+        if first == "behavior_packs":
+            return "bp"
+        if first == "resource_packs":
+            return "rp"
+        if first == "worlds":
+            return "worlds"
+    if path.name == "server.properties":
+        return "config"
+    return "other"
+
+
+def backup_item_name(path: Path, server_dir: Optional[Path], category: str) -> str:
+    if server_dir and category in ("worlds", "config"):
+        try:
+            rel_parts = path.resolve().relative_to(server_dir.resolve()).parts
+            base = "__".join(clean_name(part) for part in rel_parts)
+        except ValueError:
+            base = clean_name(path.name)
+    else:
+        base = clean_name(path.name)
+    return f"{base}.bak-{timestamp()}"
+
+
+def backup_root_for_path(path: Path) -> tuple[Path, Optional[Path], str]:
+    server_dir = find_server_root_for_path(path)
+    server_name = clean_name(server_dir.name) if server_dir else "misc"
+    root = Path(__file__).resolve().parent / ".temp-addonInstaller" / "backups"
+    server_root = safe_child_path(root, server_name, server_name)
+    category = backup_category_for_path(path, server_dir)
+    category_root = safe_child_path(server_root, category, category)
+    return category_root, server_dir, category
+
+
 def unique_backup_path(path: Path) -> Path:
-    """Return a backup path that will not overwrite an existing backup."""
-    base = path.with_name(f"{path.name}.bak-{timestamp()}")
-    if not base.exists():
-        return base
+    """Return a centralized backup path that will not overwrite an existing backup."""
+    backup_dir, server_dir, category = backup_root_for_path(path)
+    backup_name = backup_item_name(path, server_dir, category)
+    backup = safe_child_path(backup_dir, backup_name, backup_name)
+    if not backup.exists():
+        return backup
     index = 1
     while True:
-        candidate = path.with_name(f"{base.name}-{index}")
+        candidate_name = f"{backup_name}-{index}"
+        candidate = safe_child_path(backup_dir, candidate_name, candidate_name)
         if not candidate.exists():
             return candidate
         index += 1
@@ -483,7 +744,7 @@ def uninstall_backup_path(server_dir: Path, pack_path: Path, kind: str) -> Path:
     backup_root = Path(__file__).resolve().parent / ".temp-addonInstaller" / "backups"
     server_root = safe_child_path(backup_root, clean_name(server_dir.name), server_dir.name)
     kind_root = safe_child_path(server_root, kind, kind)
-    backup_name = f"{pack_path.name}.bak-{timestamp()}"
+    backup_name = f"{clean_name(pack_path.name)}.bak-{timestamp()}"
     backup = safe_child_path(kind_root, backup_name, backup_name)
     if not backup.exists():
         return backup
@@ -501,6 +762,7 @@ def backup_existing(path: Path) -> Optional[Path]:
     backup = backup_path(path)
     log.info("Backup: %s -> %s", path, backup)
     if not DRY_RUN:
+        backup.parent.mkdir(parents=True, exist_ok=True)
         if path.is_dir():
             shutil.copytree(path, backup)
         else:
@@ -519,43 +781,242 @@ def read_server_level_name(server_dir: Path) -> Optional[str]:
     return None
 
 
+def set_server_level_name(server_dir: Path, world_name: str):
+    """Set server.properties level-name and return rollback backup info."""
+    props = server_dir / "server.properties"
+    content = props.read_text(encoding="utf-8", errors="ignore") if props.exists() else ""
+    lines = content.splitlines()
+    found = False
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith("level-name="):
+            new_lines.append(f"level-name={world_name}")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"level-name={world_name}")
+    return props, write_text(props, "\n".join(new_lines) + "\n")
+
+
+def server_binary_name() -> str:
+    return "bedrock_server.exe" if sys.platform == "win32" else "bedrock_server"
+
+
+def server_binary_path(server_dir: Path) -> Path:
+    return server_dir / server_binary_name()
+
+
 def validate_server_dir(server_dir):
     missing = []
     if not (server_dir / "server.properties").exists():
         missing.append("server.properties")
-    binary_name = "bedrock_server.exe" if sys.platform == "win32" else "bedrock_server"
-    if not (server_dir / binary_name).exists():
-        missing.append(binary_name)
+    binary = server_binary_path(server_dir)
+    if not binary.exists():
+        missing.append(binary.name)
     if missing:
         raise RuntimeError(f"This folder is not a valid/complete Bedrock server. Missing: {', '.join(missing)}")
 
+
+def windows_file_version(path: Path) -> Optional[str]:
+    """Read Windows executable file version without starting the server."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version_dll = ctypes.windll.version
+        handle = wintypes.DWORD()
+        size = version_dll.GetFileVersionInfoSizeW(str(path), ctypes.byref(handle))
+        if not size:
+            return None
+
+        buffer = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(str(path), 0, size, buffer):
+            return None
+
+        value = ctypes.c_void_p()
+        value_len = wintypes.UINT()
+        if not version_dll.VerQueryValueW(buffer, "\\", ctypes.byref(value), ctypes.byref(value_len)):
+            return None
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        info = ctypes.cast(value, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        if info.dwSignature != 0xFEEF04BD:
+            return None
+        parts = [
+            info.dwFileVersionMS >> 16,
+            info.dwFileVersionMS & 0xFFFF,
+            info.dwFileVersionLS >> 16,
+            info.dwFileVersionLS & 0xFFFF,
+        ]
+        if not any(parts):
+            return None
+        return ".".join(map(str, parts))
+    except Exception as e:
+        log.debug("Cannot read Windows file version from %s: %s", path, e)
+        return None
+
+
+def read_server_version_file(server_dir: Path) -> Optional[str]:
+    """Read a simple version marker file when a server bundle provides one."""
+    version_pattern = re.compile(r"\b\d+\.\d+(?:\.\d+){1,2}\b")
+    for file_name in ("version.txt", "bedrock_server.version", "server_version.txt"):
+        path = server_dir / file_name
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        match = version_pattern.search(text)
+        if match:
+            return match.group(0)
+    return None
+
+
+def scan_binary_for_version(path: Path) -> Optional[str]:
+    """Best-effort fallback for binaries that expose a readable version string."""
+    version_pattern = re.compile(rb"\b1\.\d{1,3}\.\d{1,3}(?:\.\d{1,3})?\b")
+    matches = set()
+    try:
+        with path.open("rb") as src:
+            tail = b""
+            for _ in range(64):
+                chunk = src.read(256 * 1024)
+                if not chunk:
+                    break
+                blob = tail + chunk
+                matches.update(match.decode("ascii") for match in version_pattern.findall(blob))
+                tail = blob[-32:]
+    except OSError as e:
+        log.debug("Cannot scan server binary version from %s: %s", path, e)
+        return None
+
+    if not matches:
+        return None
+    return sorted(matches, key=lambda value: [int(part) for part in value.split(".")])[-1]
+
+
+def detect_server_version(server_dir: Path) -> Optional[str]:
+    """Return the Bedrock server version when it can be detected safely."""
+    binary = server_binary_path(server_dir)
+    return (
+        read_server_version_file(server_dir)
+        or windows_file_version(binary)
+        or scan_binary_for_version(binary)
+    )
+
+
+def format_server_version(server_dir: Path) -> str:
+    version = detect_server_version(server_dir)
+    return f"v{version}" if version else "unknown"
+
+
+def looks_like_server_dir(server_dir: Path) -> bool:
+    """Return True for folders worth showing in the server picker."""
+    return (server_dir / "server.properties").exists() or server_binary_path(server_dir).exists()
+
+
+def is_visible_folder(path: Path) -> bool:
+    """Return True for folders worth showing in interactive lists."""
+    return path.is_dir() and not path.name.startswith(".") and path.name != "__pycache__"
+
+
+def visible_folders(parent: Path) -> list[Path]:
+    if not parent.exists():
+        return []
+    return sorted([p for p in parent.iterdir() if is_visible_folder(p)], key=lambda p: p.name.lower())
+
+def addon_group_key_from_name(name: str, fallback: str = "") -> str:
+    """Return a display-oriented key that groups BP/RP sides of one addon."""
+    text = re.sub(r"§.", "", str(name)).lower()
+    text = re.sub(
+        r"[\[(]\s*(bp|rp|resource|resources|behavior|behaviour|texture|textures|addon|add-on|pack|world)\s*[\])]",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\s+-\s+(resource|resources|texture|textures|behavior|behaviour|addon|add-on|pack)\b.*$",
+        " ",
+        text,
+    )
+    text = re.sub(r"\b(resource|resources|behavior|behaviour|texture|textures)\s+pack\b", " ", text)
+    text = re.sub(r"\b(bp|rp|world)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_")
+    version_prefix = re.match(r"^(.+?\b\d+(?:\.\d+){1,3})\b", text)
+    if version_prefix:
+        text = version_prefix.group(1).strip(" -_")
+    return text or fallback
+
+
+def addon_count_key(pack_dir: Path, manifest: dict) -> str:
+    header = manifest.get("header", {})
+    name = manifest_display_name(pack_dir, manifest) or pack_dir.name
+    return addon_group_key_from_name(name, header.get("uuid") or pack_dir.name.lower())
+
+
 def server_addon_count_hint(server_dir: Path):
     """Return a short installed-addon hint for folders that look like Bedrock servers."""
-    binary_name = "bedrock_server.exe" if sys.platform == "win32" else "bedrock_server"
-    if not (server_dir / "server.properties").exists() or not (server_dir / binary_name).exists():
+    if not (server_dir / "server.properties").exists() or not server_binary_path(server_dir).exists():
         return ""
 
-    count = 0
+    addons = set()
     for folder_name in ("resource_packs", "behavior_packs"):
         base = server_dir / folder_name
         if not base.exists():
             continue
         for pack_dir in base.iterdir():
-            if (
+            if not (
                 pack_dir.is_dir()
                 and not _is_builtin_pack(pack_dir.name)
                 and (pack_dir / "manifest.json").exists()
             ):
-                count += 1
-    return f"({plural(count, 'addon')} installed)"
+                continue
+            try:
+                manifest = load_json(pack_dir / "manifest.json")
+            except Exception:
+                addons.add(pack_dir.name.lower())
+                continue
+            addons.add(addon_count_key(pack_dir, manifest))
+    return f"({plural(len(addons), 'addon')} installed)"
+
+
+def print_server_info(server_dir: Path) -> None:
+    """Show selected server metadata before choosing an action."""
+    rows = [
+        ("Folder", server_dir),
+        ("Binary", server_binary_path(server_dir).name),
+        ("Version", format_server_version(server_dir)),
+    ]
+    level_name = read_server_level_name(server_dir)
+    if level_name:
+        rows.append(("Level", level_name))
+    ui_panel("Server info", rows, kind="ok")
 
 
 def choose_server_dir():
     """Choose a Bedrock server folder through an interactive menu."""
     current = Path.cwd().resolve()
     while True:
-        print(c_divider("Server folder"))
-        ui_kv("Current", current)
+        ui_menu("Server folder", [("Current", current)])
         ui_option("1", "Use current folder", f"{current.name}/")
         ui_option("2", "Browse folders here")
         ui_option("3", "Enter custom path")
@@ -566,11 +1027,12 @@ def choose_server_dir():
             if choice == "1":
                 server_dir = current
             elif choice == "2":
-                folders = sorted([p for p in current.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+                folders = [folder for folder in visible_folders(current) if looks_like_server_dir(folder)]
                 if not folders:
-                    ui_status("warn", "No folders in this directory.")
+                    ui_status("warn", "No Bedrock server folders found here.")
+                    ui_kv("Expected", "folder with server.properties or bedrock_server(.exe)")
                     continue
-                print(c_divider("Available folders"))
+                print(c_divider("Available server folders"))
                 for idx, folder in enumerate(folders, 1):
                     ui_option(str(idx), folder.name, server_addon_count_hint(folder))
                 raw = ask("Select folder")
@@ -697,17 +1159,8 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
 
 
 
-def safe_copytree(src: Path, dest: Path):
-    """Copy src directory to dest with backup, disk check, and progress bar."""
-    backup = None
-    if dest.exists():
-        if yes_no(f"Folder {dest.name} already exists. Replace?", True):
-            backup = backup_existing(dest)
-            log.info("Remove: %s", dest)
-            if not DRY_RUN:
-                shutil.rmtree(dest)
-        else:
-            raise RuntimeError("Cancelled because the pack/world folder already exists.")
+def copytree_with_progress(src: Path, dest: Path) -> None:
+    """Copy src directory to dest with disk check and progress bar."""
     if not DRY_RUN:
         check_disk_space(src, dest.parent)
     log.info("Copy: %s → %s", src, dest)
@@ -726,7 +1179,31 @@ def safe_copytree(src: Path, dest: Path):
         shutil.copytree(src, dest, copy_function=_copy_fn)
         if total == 0:
             pass  # empty directory, no progress to show
-        log.info("Copy complete: %s \u2192 %s (%d files)", src, dest, total)
+        log.info("Copy complete: %s → %s (%d files)", src, dest, total)
+
+
+def safe_copytree(src: Path, dest: Path):
+    """Copy src directory to dest with backup, disk check, and progress bar."""
+    backup = None
+    if dest.exists():
+        if yes_no(f"Folder {dest.name} already exists. Replace?", True):
+            backup = backup_existing(dest)
+            log.info("Remove: %s", dest)
+            if not DRY_RUN:
+                shutil.rmtree(dest)
+        else:
+            raise RuntimeError("Cancelled because the pack/world folder already exists.")
+    copytree_with_progress(src, dest)
+    return backup
+
+
+def replace_copytree(src: Path, dest: Path):
+    """Replace an existing directory after caller has confirmed the overwrite."""
+    backup = backup_existing(dest)
+    log.info("Remove: %s", dest)
+    if not DRY_RUN and dest.exists():
+        shutil.rmtree(dest)
+    copytree_with_progress(src, dest)
     return backup
 
 
@@ -919,8 +1396,7 @@ def choose_archive_location(server_dir):
     cwd = Path.cwd().resolve()
 
     while True:
-        print(c_divider("Addon source"))
-        ui_kv("Project", cwd)
+        ui_menu("Addon source", [("Project", cwd)])
         ui_option("1", "Browse project folders", f"{cwd.name}/")
         ui_option("2", "Scan server folder", f"{server_dir.name}/")
         ui_option("3", "Enter custom folder or file")
@@ -928,9 +1404,7 @@ def choose_archive_location(server_dir):
         choice = ask("Select option", "1")
 
         if choice == "1":
-            folders = sorted([p for p in cwd.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
-            # Hide internal folders
-            folders = [f for f in folders if not f.name.startswith((".") ) and f.name != "__pycache__"]
+            folders = visible_folders(cwd)
             if not folders:
                 ui_status("warn", "No folders in this directory.")
                 continue
@@ -1060,29 +1534,29 @@ def render_checkbox_picker(candidates, selected, cursor, search_dirs, archive_hi
     """Render the interactive addon picker."""
     clear_screen()
     scan_names = ", ".join(d.name for d in search_dirs if d.exists())
-    print(c_divider("Select addons"))
-    ui_kv("Found", plural(len(candidates), "file"))
-    ui_kv("Selected", plural(len(selected), "file"))
-    ui_kv("Source", scan_names or "-")
+    ui_menu("Select addons", [
+        ("Found", plural(len(candidates), "file")),
+        ("Selected", plural(len(selected), "file")),
+        ("Source", scan_names or "-"),
+    ])
     print()
+    selected_order = {index: position + 1 for position, index in enumerate(selected)}
     for i, path in enumerate(candidates):
-        pointer = ">" if i == cursor else " "
-        mark = "x" if i in selected else " "
-        folder = c_gray(f'({path.parent.name}/)')
         hint = archive_hints.get(path, "")
-        suffix = f" {hint}" if hint else ""
-        print(f"  {pointer} [{mark}] {i + 1}. {path.name} {folder}{suffix}")
+        folder = f"({path.parent.name}/)"
+        row_hint = f"{folder} {strip_ansi(hint)}".strip()
+        ui_checkbox_row(i + 1, path.name, i in selected_order, i == cursor, row_hint, selected_order.get(i))
     print()
-    ui_kv("Keys", "↑/↓ move · Space select · Enter continue")
-    ui_kv("Shortcuts", "a all · c clear · r refresh · m add file · q cancel")
+    ui_help("↑/↓ move", "Space select", "Enter continue")
+    ui_help("a all", "c clear", "r refresh", "m add file", "q cancel")
 
 
 def choose_archives_keyboard(candidates, search_dirs, server_dir):
-    """Choose addons with arrow keys + Space."""
+    """Choose addons with arrow keys + Space, preserving the order they were selected."""
     if not candidates:
         return []
     cursor = 0
-    selected = set()
+    selected = []
     archive_hints = build_archive_hints(candidates, server_dir)
     while True:
         render_checkbox_picker(candidates, selected, cursor, search_dirs, archive_hints)
@@ -1095,24 +1569,24 @@ def choose_archives_keyboard(candidates, search_dirs, server_dir):
             if cursor in selected:
                 selected.remove(cursor)
             else:
-                selected.add(cursor)
+                selected.append(cursor)
         elif key == "enter":
             print()
-            return [candidates[i] for i in sorted(selected)]
+            return [candidates[i] for i in selected]
         elif key == "a":
-            selected = set(range(len(candidates)))
+            selected = list(range(len(candidates)))
         elif key == "c":
             selected.clear()
         elif key == "r":
-            old_selected_paths = {candidates[i] for i in selected}
+            old_selected_paths = [candidates[i] for i in selected]
             candidates.clear()
             candidates.extend(list_archives(search_dirs))
             archive_hints.clear()
             archive_hints.update(build_archive_hints(candidates, server_dir))
             selected.clear()
-            for i, path in enumerate(candidates):
-                if path in old_selected_paths:
-                    selected.add(i)
+            for old_path in old_selected_paths:
+                if old_path in candidates:
+                    selected.append(candidates.index(old_path))
             cursor = min(cursor, max(len(candidates) - 1, 0))
         elif key == "m":
             print()
@@ -1121,11 +1595,11 @@ def choose_archives_keyboard(candidates, search_dirs, server_dir):
                 manual_path = Path(manual).expanduser().resolve()
                 if not manual_path.exists():
                     ui_status("err", f"File does not exist: {manual_path}")
-                    input("Press Enter to continue...")
+                    ui_pause()
                     continue
                 if not manual_path.is_file() or not is_pack_file(manual_path):
                     ui_status("err", f"File is not a Bedrock addon/template/archive: {manual_path}")
-                    input("Press Enter to continue...")
+                    ui_pause()
                     continue
                 candidates.append(manual_path)
                 hint = archive_installed_hint(
@@ -1138,7 +1612,7 @@ def choose_archives_keyboard(candidates, search_dirs, server_dir):
                 )
                 if hint:
                     archive_hints[manual_path] = hint
-                selected.add(len(candidates) - 1)
+                selected.append(len(candidates) - 1)
                 cursor = len(candidates) - 1
         elif key == "q":
             print()
@@ -1146,22 +1620,23 @@ def choose_archives_keyboard(candidates, search_dirs, server_dir):
 
 
 def choose_archives_text(candidates, search_dirs, server_dir):
-    """Text-input fallback addon picker."""
-    selected = set()
+    """Text-input fallback addon picker, preserving the order toggles were selected."""
+    selected = []
     archive_hints = build_archive_hints(candidates, server_dir)
     while True:
-        print(c_divider("Select addons"))
-        ui_kv("Found", plural(len(candidates), "file"))
-        ui_kv("Selected", plural(len(selected), "file"))
+        ui_menu("Select addons", [
+            ("Found", plural(len(candidates), "file")),
+            ("Selected", plural(len(selected), "file")),
+        ])
+        selected_order = {index: position + 1 for position, index in enumerate(selected)}
         for i, path in enumerate(candidates, 1):
-            mark = "x" if i in selected else " "
-            folder = f'({path.parent.name}/)'
             hint = archive_hints.get(path, "")
-            suffix = f" {hint}" if hint else ""
-            print(f"  [{mark}] {i}. {path.name} {folder}{suffix}")
+            folder = f"({path.parent.name}/)"
+            row_hint = f"{folder} {strip_ansi(hint)}".strip()
+            ui_checkbox_row(i, path.name, i in selected_order, False, row_hint, selected_order.get(i))
         print()
         ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
-        ui_kv("Shortcuts", "a all · c clear · r refresh · 0 add file · q exit · Enter continue")
+        ui_help("a all", "c clear", "r refresh", "0 add file", "q exit", "Enter continue")
 
         choice = ask("Choose addon/template", "", allow_exit=False)
         if is_exit_choice(choice) and choice != "0":
@@ -1169,21 +1644,21 @@ def choose_archives_text(candidates, search_dirs, server_dir):
         if choice == "":
             break
         if choice.lower() == "a":
-            selected = set(range(1, len(candidates) + 1))
+            selected = list(range(1, len(candidates) + 1))
             continue
         if choice.lower() == "c":
             selected.clear()
             continue
         if choice.lower() == "r":
-            old_selected_paths = {candidates[i - 1] for i in selected}
+            old_selected_paths = [candidates[i - 1] for i in selected]
             candidates.clear()
             candidates.extend(list_archives(search_dirs))
             archive_hints.clear()
             archive_hints.update(build_archive_hints(candidates, server_dir))
             selected.clear()
-            for i, path in enumerate(candidates, 1):
-                if path in old_selected_paths:
-                    selected.add(i)
+            for old_path in old_selected_paths:
+                if old_path in candidates:
+                    selected.append(candidates.index(old_path) + 1)
             ui_status("ok", f"Refreshed: {plural(len(candidates), 'file')} found.")
             continue
         if choice == "0":
@@ -1207,7 +1682,7 @@ def choose_archives_text(candidates, search_dirs, server_dir):
                 )
                 if hint:
                     archive_hints[manual_path] = hint
-                selected.add(len(candidates))
+                selected.append(len(candidates))
             continue
 
         ok = True
@@ -1222,11 +1697,11 @@ def choose_archives_text(candidates, search_dirs, server_dir):
             if index in selected:
                 selected.remove(index)
             else:
-                selected.add(index)
+                selected.append(index)
         if not ok:
             ui_status("warn", "Invalid choice. Use numbers, example: 1 or 1,3.")
 
-    return [candidates[i - 1] for i in sorted(selected)]
+    return [candidates[i - 1] for i in selected]
 
 
 def choose_archives(server_dir):
@@ -1254,9 +1729,7 @@ def choose_archives(server_dir):
 def install_pack_dir(pack_dir, manifest, server_dir):
     kinds = detect_pack_kinds(manifest)
     if not kinds:
-        msg = f"Skip {pack_dir}: not a Bedrock RP/BP"
-        print(msg)
-        log.warning(msg)
+        log.info("Skip non-pack manifest %s: %s", pack_dir, manifest_kind_label(manifest))
         return []
 
     header = manifest.get("header", {})
@@ -1308,6 +1781,107 @@ def install_pack_dir(pack_dir, manifest, server_dir):
     return installed
 
 
+def template_world_default_name(src_world: Path) -> str:
+    levelname_file = src_world / "levelname.txt"
+    default_name = levelname_file.read_text(errors="ignore").strip() if levelname_file.exists() else src_world.name
+    return default_name or src_world.name
+
+
+def next_bedrock_world_name(worlds_dir: Path) -> str:
+    """Suggest Bedrock level, Bedrock level-2, Bedrock level-3, etc."""
+    base = "Bedrock level"
+    existing = {folder.name.lower() for folder in visible_folders(worlds_dir)}
+    if base.lower() not in existing:
+        return base
+    index = 2
+    while True:
+        candidate = f"{base}-{index}"
+        if candidate.lower() not in existing:
+            return candidate
+        index += 1
+
+
+def choose_world_to_replace(existing_worlds):
+    print(c_divider("Replace existing world"))
+    for i, world in enumerate(existing_worlds, 1):
+        ui_option(str(i), world.name, str(world))
+    ui_option("0", "Skip world import")
+    while True:
+        choice = ask("World to replace", "0", allow_exit=False)
+        if is_exit_choice(choice):
+            return None
+        try:
+            idx = int(choice)
+        except ValueError:
+            ui_status("warn", "Enter a valid number.")
+            continue
+        if 1 <= idx <= len(existing_worlds):
+            return existing_worlds[idx - 1]
+        ui_status("warn", f"Choose a number 0-{len(existing_worlds)}.")
+
+
+def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, server_dir: Path):
+    suggested_name = next_bedrock_world_name(worlds_dir)
+    if suggested_name != default_name:
+        ui_kv("Suggested folder", suggested_name)
+    while True:
+        world_name = safe_world_name(ask(f"New world folder name for template {src_world.name}", suggested_name))
+        dest = safe_child_path(worlds_dir, world_name, world_name)
+        if dest.exists():
+            ui_status("warn", f"World folder already exists: {world_name}. Choose another name or replace existing world.")
+            continue
+        break
+
+    backup = safe_copytree(src_world, dest)
+    renamed_local_packs = normalize_world_local_pack_folders(dest)
+    record = {
+        "path": dest,
+        "backup": backup,
+        "action": "created",
+        "source": src_world.name,
+        "renamed_local_packs": renamed_local_packs,
+        "level_name_changed": False,
+        "manual_level_name": False,
+        "config_changes": [],
+    }
+
+    if yes_no(f'Set server.properties level-name to "{world_name}" so server uses this new world?', True):
+        props, config_backup = set_server_level_name(server_dir, world_name)
+        record["config_changes"].append((props, config_backup))
+        record["level_name_changed"] = True
+        ui_status("ok", f"server.properties level-name={world_name}")
+    else:
+        record["manual_level_name"] = True
+        ui_status("info", "server.properties not changed. Set level-name manually if server should load this world.")
+    return record
+
+
+def import_world_replace(src_world: Path, existing_worlds):
+    dest = choose_world_to_replace(existing_worlds)
+    if dest is None:
+        ui_status("warn", "Skipped world import.")
+        return None
+
+    ui_status("err", f"This replaces current world folder and progress: {dest.name}")
+    ui_status("err", "A backup will be created first, but active world progress will be overwritten.")
+    if not yes_no("Replace this world now?", False):
+        ui_status("warn", "Skipped world replacement.")
+        return None
+
+    backup = replace_copytree(src_world, dest)
+    renamed_local_packs = normalize_world_local_pack_folders(dest)
+    return {
+        "path": dest,
+        "backup": backup,
+        "action": "replaced",
+        "source": src_world.name,
+        "renamed_local_packs": renamed_local_packs,
+        "level_name_changed": False,
+        "manual_level_name": False,
+        "config_changes": [],
+    }
+
+
 def import_world_dir(src_world, server_dir):
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
@@ -1315,13 +1889,28 @@ def import_world_dir(src_world, server_dir):
     else:
         action(f"Ensure dir: {worlds_dir}")
 
-    levelname_file = src_world / "levelname.txt"
-    default_name = levelname_file.read_text(errors="ignore").strip() if levelname_file.exists() else src_world.name
-    default_name = default_name or src_world.name
-    world_name = safe_world_name(ask(f"World name to import from template {src_world.name}", default_name))
-    dest = safe_child_path(worlds_dir, world_name, world_name)
-    backup = safe_copytree(src_world, dest)
-    return {"path": dest, "backup": backup}
+    src_world = Path(src_world)
+    default_name = template_world_default_name(src_world)
+    existing_worlds = visible_folders(worlds_dir)
+
+    print(c_divider(f"World import: {src_world.name}"))
+    ui_kv("Template name", default_name)
+    ui_option("1", "Create new independent world", "does not touch existing worlds")
+    if existing_worlds:
+        ui_option("2", "Replace existing world", "backs up then overwrites world progress")
+    ui_option("0", "Skip world import")
+
+    while True:
+        choice = ask("World import action", "1", allow_exit=False)
+        if is_exit_choice(choice):
+            ui_status("warn", "Skipped world import.")
+            return None
+        if choice == "1":
+            return import_world_as_new(src_world, worlds_dir, default_name, server_dir)
+        if choice == "2" and existing_worlds:
+            return import_world_replace(src_world, existing_worlds)
+        valid = "0, 1, or 2" if existing_worlds else "0 or 1"
+        ui_status("warn", f"Choose {valid}.")
 
 
 def is_pack_name(name: str) -> bool:
@@ -1410,7 +1999,7 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     validate_uuid(pack_id, f"manifest {manifest_name} header.uuid")
     kinds = detect_pack_kinds(manifest)
     if not kinds:
-        ui_status("warn", f"Skip manifest without resource/data module: {manifest_name}")
+        log.info("Skip non-pack manifest %s: %s", manifest_name, manifest_kind_label(manifest))
         return installed
 
     for kind in kinds:
@@ -1443,6 +2032,63 @@ def format_version(version) -> str:
 
 def kind_name(kind: str) -> str:
     return "Resource Pack" if kind == "rp" else "Behavior Pack"
+
+
+def inspect_version(manifest: dict) -> str:
+    """Return a readable version string without failing the whole inspect report."""
+    raw_version = manifest.get("header", {}).get("version")
+    try:
+        return format_version(version_array(raw_version))
+    except Exception:
+        return f"{format_version(raw_version)} (invalid)"
+
+
+def inspect_archive(archive: Path) -> None:
+    """Print addon archive metadata without extracting or installing."""
+    if not is_pack_file(archive):
+        raise RuntimeError(f"File is not a supported addon/template/archive: {archive}")
+
+    validate_archive(archive)
+    size_mb = archive.stat().st_size / (1024 * 1024)
+    manifest_items = load_manifests_from_archive(archive)
+    bp_count, rp_count = pack_kind_counts(manifest_items)
+
+    print(c_divider("Inspect addon"))
+    ui_kv("File", archive)
+    ui_kv("Size", f"{size_mb:.1f} MB")
+    ui_kv("Manifests", plural(len(manifest_items), "manifest"))
+    ui_kv("Detected", f"{bp_count} BP, {rp_count} RP")
+
+    if not manifest_items:
+        ui_status("warn", "No manifest.json files found in this archive.")
+        return
+
+    for index, (manifest_name, manifest) in enumerate(manifest_items, 1):
+        header = manifest.get("header", {})
+        pack_name = header.get("name") or "Unnamed pack"
+        pack_id = header.get("uuid") or "missing"
+        kind_labels = manifest_kind_label(manifest)
+        dependencies = manifest_dependencies(manifest)
+
+        print(c_divider(f"Manifest {index}: {pack_name}"))
+        ui_kv("Source", manifest_name)
+        ui_kv("Name", pack_name)
+        ui_kv("Kind", kind_labels)
+        ui_kv("UUID", pack_id)
+        ui_kv("Version", inspect_version(manifest))
+
+        try:
+            validate_uuid(pack_id, context=str(manifest_name))
+        except RuntimeError as e:
+            ui_status("warn", str(e))
+
+        if dependencies:
+            ui_kv("Dependencies", plural(len(dependencies), "dependency", "dependencies"))
+            for dep in dependencies:
+                ui_kv("  UUID", dep["uuid"])
+                ui_kv("  Version", format_version(dep.get("version")))
+        else:
+            ui_kv("Dependencies", "none")
 
 
 def build_archive_batch_context(archives, server_dir):
@@ -1594,8 +2240,10 @@ def print_install_conflicts(conflicts) -> None:
         ui_status("ok", "No install conflicts found.")
         return
 
-    print(c_divider("Install conflicts"))
-    ui_status("warn", f"Found {plural(len(conflicts), 'possible conflict')} before copying files.")
+    ui_panel("Install conflicts", [
+        f"{ui_badge('WARN', 'warn')} Found {plural(len(conflicts), 'possible conflict')} before copying files.",
+        ("Safety", "Installer will still ask before replacing files."),
+    ], kind="warn")
     for idx, conflict in enumerate(conflicts, 1):
         record = conflict["record"]
         installed = conflict.get("installed") or {}
@@ -1630,23 +2278,23 @@ def confirm_install_conflicts(conflicts) -> bool:
 
 def print_archive_batch_overview(context, archive_count) -> None:
     """Print a compact overview before individual archive processing."""
-    print(c_divider("Selected Content"))
-    ui_kv("Archives", plural(archive_count, "archive"))
-    ui_kv("Detected", f"{context['bp_count']} BP, {context['rp_count']} RP")
+    rows = [
+        ("Archives", plural(archive_count, "archive")),
+        ("Detected", f"{context['bp_count']} BP, {context['rp_count']} RP"),
+    ]
+    deps = context["dependencies"]
+    if deps:
+        matched = sum(1 for dep in deps if dep["uuid"] in context["available_ids"])
+        rows.append(("Dependencies", f"{matched}/{len(deps)} manifest dependencies found"))
+    ui_panel("Selected content", rows, kind="info")
     if context["bp_count"] and context["rp_count"]:
         ui_status("ok", "BP/RP packs are present across this install batch.")
     elif context["bp_count"]:
         ui_status("warn", "Only Behavior Packs detected in the selected archives.")
     elif context["rp_count"]:
         ui_status("warn", "Only Resource Packs detected in the selected archives.")
-
-    deps = context["dependencies"]
-    if deps:
-        matched = sum(1 for dep in deps if dep["uuid"] in context["available_ids"])
-        if matched == len(deps):
-            ui_status("ok", f"Manifest dependencies found: {matched}/{len(deps)}.")
-        else:
-            ui_status("warn", f"Manifest dependencies found: {matched}/{len(deps)}.")
+    if deps and matched != len(deps):
+        ui_status("warn", f"Manifest dependencies found: {matched}/{len(deps)}.")
 
 
 def pack_kind_counts(pack_items) -> tuple[int, int]:
@@ -1654,6 +2302,19 @@ def pack_kind_counts(pack_items) -> tuple[int, int]:
     bp_count = sum(1 for _, manifest in pack_items if "bp" in detect_pack_kinds(manifest))
     rp_count = sum(1 for _, manifest in pack_items if "rp" in detect_pack_kinds(manifest))
     return bp_count, rp_count
+
+
+def world_template_count(pack_items) -> int:
+    """Return the number of world template manifests in scanned content."""
+    return sum(1 for _, manifest in pack_items if "world_template" in manifest_module_types(manifest))
+
+
+def format_detected_content(bp_count: int, rp_count: int, template_count: int, world_count: int) -> str:
+    parts = [f"{bp_count} BP", f"{rp_count} RP"]
+    if template_count:
+        parts.append(plural(template_count, "world template"))
+    parts.append(plural(world_count, "world"))
+    return ", ".join(parts)
 
 
 def pack_content_label(bp_count: int, rp_count: int) -> str:
@@ -1668,7 +2329,7 @@ def pack_content_label(bp_count: int, rp_count: int) -> str:
 
 
 def print_pack_kind_notice(pack_items, batch_available_ids=None) -> None:
-    """Highlight whether this archive contains BP, RP, or both."""
+    """Print only extra scan notes that are not already covered by the detected row."""
     batch_available_ids = batch_available_ids or set()
     bp_count, rp_count = pack_kind_counts(pack_items)
     dependencies = [
@@ -1677,7 +2338,9 @@ def print_pack_kind_notice(pack_items, batch_available_ids=None) -> None:
         for dep in manifest_dependencies(manifest)
     ]
     matched_deps = [dep for dep in dependencies if dep["uuid"] in batch_available_ids]
-    ui_subitem(c_gray("Content:"), pack_content_label(bp_count, rp_count))
+    if world_template_count(pack_items):
+        ui_subitem(c_gray("World template:"), "metadata/preset for a template; it is not installed as BP/RP")
+        ui_subitem(c_gray("World:"), "playable folder imported into server worlds/ when selected")
     if bp_count and not rp_count and not matched_deps:
         ui_subitem(c_warn("Note:"), "Install companion resource pack separately if needed.")
 
@@ -1694,7 +2357,8 @@ def process_archive(archive, server_dir, batch_context=None):
         installed = []
         manifest_items = load_manifests_from_archive(archive)
         bp_count, rp_count = pack_kind_counts(manifest_items)
-        ui_subitem(c_gray("Detected:"), f"{bp_count} BP, {rp_count} RP, 0 worlds")
+        template_count = world_template_count(manifest_items)
+        ui_subitem(c_gray("Detected:"), format_detected_content(bp_count, rp_count, template_count, 0))
         print_pack_kind_notice(manifest_items, batch_available_ids)
         ui_phase("Simulate install")
         for manifest_name, manifest in manifest_items:
@@ -1724,7 +2388,8 @@ def process_archive(archive, server_dir, batch_context=None):
                 ui_status("warn", f"Skip invalid manifest: {manifest_path} ({e})")
                 log.warning("Skip invalid manifest %s: %s", manifest_path, e)
         bp_count, rp_count = pack_kind_counts(manifest_items)
-        ui_subitem(c_gray("Detected:"), f"{bp_count} BP, {rp_count} RP, {len(world_dirs)} worlds")
+        template_count = world_template_count(manifest_items)
+        ui_subitem(c_gray("Detected:"), format_detected_content(bp_count, rp_count, template_count, len(world_dirs)))
         print_pack_kind_notice(manifest_items, batch_available_ids)
 
         ui_phase("Install packs")
@@ -1746,7 +2411,9 @@ def process_archive(archive, server_dir, batch_context=None):
             ui_phase("World imports")
         for world_dir in world_dirs:
             if yes_no(f"Template/world detected: {world_dir.name}. Import world?", True):
-                imported_worlds.append(import_world_dir(world_dir, server_dir))
+                imported = import_world_dir(world_dir, server_dir)
+                if imported:
+                    imported_worlds.append(imported)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return installed, imported_worlds
@@ -1810,7 +2477,7 @@ def imported_world_path(world):
 
 def choose_world(server_dir, imported_worlds):
     if imported_worlds:
-        print(c_divider("Imported Worlds"))
+        print(c_divider("Imported worlds"))
         for i, w in enumerate(imported_worlds, 1):
             path = imported_world_path(w)
             ui_option(str(i), path.name, str(path))
@@ -1833,14 +2500,14 @@ def choose_world(server_dir, imported_worlds):
         worlds_dir.mkdir(parents=True, exist_ok=True)
     else:
         action(f"Ensure dir: {worlds_dir}")
-    existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    existing = visible_folders(worlds_dir)
 
     if existing:
-        print(c_divider("World Folders"))
+        print(c_divider("World folders"))
         for i, w in enumerate(existing, 1):
             ui_option(str(i), w.name)
         ui_option("0", "Create/use another name")
-        ui_kv("Shortcuts", "q/exit cancel")
+        ui_help("q/exit cancel")
         # Handle non-integer input without crashing
         while True:
             choice = ask("Choose world", "1", allow_exit=False)
@@ -1877,7 +2544,7 @@ def choose_world(server_dir, imported_worlds):
 
 def choose_existing_world(server_dir):
     worlds_dir = server_dir / "worlds"
-    existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    existing = visible_folders(worlds_dir)
     if not existing:
         ui_status("warn", "No world folders found.")
         return None
@@ -1905,11 +2572,13 @@ def _tick(cond: bool) -> str:
 def print_summary(archive_results, dep_missing) -> None:
     """Print a separate summary for each addon/archive."""
     for archive_name, packs, worlds in archive_results:
-        print(c_divider(f"Summary: {archive_name}"))
-        ui_kv("Installed", plural(len(packs), "pack"))
-        ui_kv("Imported worlds", plural(len(worlds), "world"))
+        rows = [
+            ("Installed", plural(len(packs), "pack")),
+            ("Imported worlds", plural(len(worlds), "world")),
+        ]
         if DRY_RUN:
-            ui_kv("Mode", c_yellow("DRY-RUN"))
+            rows.append(("Mode", ui_badge("DRY-RUN", "warn")))
+        ui_panel(f"Summary: {archive_name}", rows, kind="ok")
 
         # Show processed addon name and UUID
         seen = set()
@@ -1939,7 +2608,22 @@ def print_summary(archive_results, dep_missing) -> None:
 
         # World Import
         for w in worlds:
-            ui_kv("  World", imported_world_path(w))
+            path = imported_world_path(w)
+            action_label = "replaced existing world" if w.get("action") == "replaced" else "created new world"
+            ui_kv("  World", path)
+            ui_kv("  Source", w.get("source", "unknown"))
+            ui_kv("  Action", action_label)
+            if w.get("backup"):
+                ui_kv("  Backup", w["backup"])
+            renamed_local_packs = w.get("renamed_local_packs") or []
+            if renamed_local_packs:
+                ui_kv("  Local packs renamed", plural(len(renamed_local_packs), "folder"))
+                for renamed in renamed_local_packs:
+                    ui_kv("    Folder", f"{renamed['old']} -> {renamed['new']}")
+            if w.get("level_name_changed"):
+                ui_kv("  server.properties", "level-name updated")
+            elif w.get("manual_level_name"):
+                ui_kv("  server.properties", "manual level-name update needed")
 
         # Missing Deps per addon
         pack_ids = {p["pack_id"] for p in packs}
@@ -2033,71 +2717,135 @@ def default_world_dir(server_dir):
     prop_name = read_server_level_name(server_dir)
     if prop_name and (worlds_dir / prop_name).is_dir():
         return worlds_dir / prop_name
-    existing = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    existing = visible_folders(worlds_dir)
     return existing[0] if len(existing) == 1 else None
 
-def world_ordered_pack_rows(server_dir, world_dir):
-    """Return enabled world packs in the exact BP/RP JSON order."""
-    name_map = installed_pack_name_map(server_dir)
-    rows = []
-    for kind, file_name, section in (
-        ("bp", "world_behavior_packs.json", "Behavior packs"),
-        ("rp", "world_resource_packs.json", "Resource packs"),
+def installed_pack_lookup(server_dir):
+    return {
+        (pack.get("pack_id"), pack.get("kind")): pack
+        for pack in get_installed_addons(server_dir)
+        if pack.get("pack_id") and pack.get("kind")
+    }
+
+
+def addon_display_name(name: str) -> str:
+    """Return a clean addon name for combined BP/RP overview rows."""
+    return clean_pack_title(name)
+
+
+def version_sort_value(version):
+    return ".".join(map(str, version)) if isinstance(version, list) else str(version or "")
+
+
+def format_group_versions(group):
+    versions = {
+        kind: version_sort_value(item.get("version"))
+        for kind, item in group["items"].items()
+        if item.get("version") is not None
+    }
+    if not versions:
+        return ""
+    if len(set(versions.values())) == 1:
+        return f" {c_gray('v' + next(iter(versions.values())))}"
+    parts = []
+    if "bp" in versions:
+        parts.append(f"BP v{versions['bp']}")
+    if "rp" in versions:
+        parts.append(f"RP v{versions['rp']}")
+    return f" {c_gray(' / '.join(parts))}"
+
+
+def world_ordered_addon_rows(server_dir, world_dir):
+    """Return enabled world addons grouped into combined BP/RP rows."""
+    pack_lookup = installed_pack_lookup(server_dir)
+    groups = {}
+    for kind, file_name, kind_order in (
+        ("bp", "world_behavior_packs.json", 0),
+        ("rp", "world_resource_packs.json", 1),
     ):
         entries = read_pack_list(world_dir / file_name)
         for index, entry in enumerate(entries, 1):
             pack_id = entry.get("pack_id", "")
-            rows.append({
-                "section": section,
-                "index": index,
-                "kind": kind,
-                "pack_id": pack_id,
-                "name": name_map.get((pack_id, kind)) or f"Unknown pack {pack_id[:8]}",
-                "version": entry.get("version"),
+            installed = pack_lookup.get((pack_id, kind)) or {}
+            name = installed.get("name") or f"Unknown pack {pack_id[:8]}"
+            version = entry.get("version")
+            key = addon_group_key_from_name(name, pack_id or f"{kind}:{index}")
+            group = groups.setdefault(key, {
+                "names": [],
+                "items": {},
+                "orders": [],
             })
-    return rows
+            group["names"].append(addon_display_name(name))
+            group["items"][kind] = {
+                "pack_id": pack_id,
+                "name": name,
+                "version": version,
+            }
+            group["orders"].append((index, kind_order))
+
+    rows = []
+    for group in groups.values():
+        rows.append({
+            "name": min(group["names"], key=lambda value: (len(value), value.lower())),
+            "items": group["items"],
+            "order": min(group["orders"]),
+        })
+    return sorted(rows, key=lambda row: (row["order"], row["name"].lower()))
+
+
+def addon_kind_label(items):
+    labels = []
+    if "bp" in items:
+        labels.append(ui_badge("BP", "accent"))
+    if "rp" in items:
+        labels.append(ui_badge("RP", "info"))
+    return " ".join(labels)
 
 
 def print_installed_addon_overview(server_dir, world_dir=None):
-    """Show installed addons and world load order before choosing an action."""
+    """Show enabled addon order before the action menu."""
     installed = get_installed_addons(server_dir)
     print()
-    print(c_bold("Installed addons on this server"))
     if not installed:
-        ui_status("warn", "No installed addons found.")
+        ui_panel("Current addon status", [
+            f"{ui_badge('WARN', 'warn')} No installed addons found in behavior_packs/resource_packs.",
+            ("Next", "Choose Install addon to add packs to a world."),
+        ], kind="warn")
         return
 
     if world_dir:
-        ui_kv("World", world_dir.name)
-        rows = world_ordered_pack_rows(server_dir, world_dir)
+        rows = world_ordered_addon_rows(server_dir, world_dir)
         if rows:
-            current_section = None
-            for row in rows:
-                if row["section"] != current_section:
-                    current_section = row["section"]
-                    ui_kv(current_section, "world load order")
-                kind_text = c_cyan("[BP]") if row["kind"] == "bp" else c_cyan("[RP]")
-                version = row.get("version")
-                version_text = f" {c_gray('v' + '.'.join(map(str, version)))}" if isinstance(version, list) else ""
-                print(f"  {row['index']}. {kind_text} {row['name']}{version_text}")
+            ui_panel("Current addon status", [
+                ("World", world_dir.name),
+                ("Showing", "addons enabled in this world, saved load order"),
+                ("Tip", "Number 1 is first entry in world pack JSON"),
+            ], kind="ok")
+            for index, row in enumerate(rows, 1):
+                kind_text = addon_kind_label(row["items"])
+                print(f"  {ui_badge(str(index), 'muted')} {kind_text} {row['name']}{format_group_versions(row)}")
             return
-        ui_status("warn", f"No enabled pack entries found in world: {world_dir.name}")
+        ui_panel("Current addon status", [
+            ("World", world_dir.name),
+            f"{ui_badge('WARN', 'warn')} No enabled pack entries found in this world.",
+            ("Next", "Choose Install addon to enable packs."),
+        ], kind="warn")
 
     grouped = {}
     for pack in installed:
-        item = grouped.setdefault(pack["name"], {"kinds": set()})
-        item["kinds"].add(pack["kind"])
+        key = addon_group_key_from_name(pack["name"], pack.get("pack_id") or pack["name"])
+        item = grouped.setdefault(key, {"names": [], "items": {}})
+        item["names"].append(addon_display_name(pack["name"]))
+        item["items"][pack["kind"]] = pack
 
-    ui_kv("World", "not selected; showing installed folder list")
-    for idx, (name, data) in enumerate(sorted(grouped.items(), key=lambda item: item[0].lower()), 1):
-        kinds = data["kinds"]
-        labels = []
-        if "bp" in kinds:
-            labels.append("BP")
-        if "rp" in kinds:
-            labels.append("RP")
-        kind_text = c_cyan(f"[{'/'.join(labels)}]")
-        print(f"  {idx}. {kind_text} {name}")
+    ui_panel("Current addon status", [
+        ("World", "not selected"),
+        ("Showing", "installed folders only; not world load order"),
+    ])
+    for idx, data in enumerate(sorted(grouped.values(), key=lambda item: min(item["names"]).lower()), 1):
+        name = min(data["names"], key=lambda value: (len(value), value.lower()))
+        kind_text = addon_kind_label(data["items"])
+        print(f"  {ui_badge(str(idx), 'muted')} {kind_text} {name}{format_group_versions(data)}")
 
 def installed_pack_name_map(server_dir):
     return {
@@ -2106,45 +2854,61 @@ def installed_pack_name_map(server_dir):
         if pack.get("pack_id") and pack.get("kind")
     }
 
-def world_pack_reorder_options(world_dir):
-    options = []
-    for kind, file_name, label in (
-        ("bp", "world_behavior_packs.json", "Behavior Packs"),
-        ("rp", "world_resource_packs.json", "Resource Packs"),
-    ):
-        path = world_dir / file_name
+def world_pack_paths(world_dir):
+    return {
+        "bp": world_dir / "world_behavior_packs.json",
+        "rp": world_dir / "world_resource_packs.json",
+    }
+
+
+def combined_world_reorder_entries(server_dir, world_dir):
+    """Return one reorder row per addon, with BP/RP sides linked together."""
+    pack_lookup = installed_pack_lookup(server_dir)
+    groups = {}
+    for kind, path in world_pack_paths(world_dir).items():
         entries = read_pack_list(path)
-        if entries:
-            options.append({"kind": kind, "label": label, "path": path, "entries": entries})
-    return options
+        for index, entry in enumerate(entries):
+            pack_id = entry.get("pack_id", "")
+            installed = pack_lookup.get((pack_id, kind)) or {}
+            name = installed.get("name") or f"Unknown pack {pack_id[:8]}"
+            key = addon_group_key_from_name(name, pack_id or f"{kind}:{index}")
+            group = groups.setdefault(key, {
+                "names": [],
+                "items": {},
+                "orders": [],
+            })
+            group["names"].append(addon_display_name(name))
+            group["items"][kind] = {
+                "entry": entry,
+                "pack_id": pack_id,
+                "name": name,
+                "version": entry.get("version"),
+            }
+            group["orders"].append((index, 0 if kind == "bp" else 1))
 
-def choose_reorder_target(world_dir):
-    options = world_pack_reorder_options(world_dir)
-    if not options:
-        ui_status("warn", f"No world pack JSON entries found in {world_dir.name}.")
-        return None
-    if len(options) == 1:
-        return options[0]
-    print(c_divider("Choose pack list"))
-    for i, option in enumerate(options, 1):
-        ui_option(str(i), option["label"], f"({plural(len(option['entries']), 'pack')})")
-    while True:
-        raw = ask("Choose pack list", "1")
-        try:
-            idx = int(raw)
-            if 1 <= idx <= len(options):
-                return options[idx - 1]
-            ui_status("warn", f"Choose a number 1-{len(options)}.")
-        except ValueError:
-            ui_status("warn", "Enter a valid number.")
+    rows = []
+    for group in groups.values():
+        rows.append({
+            "name": min(group["names"], key=lambda value: (len(value), value.lower())),
+            "items": group["items"],
+            "order": min(group["orders"]),
+        })
+    return sorted(rows, key=lambda row: (row["order"], row["name"].lower()))
 
-def pack_entry_label(entry, kind, name_map):
-    pack_id = entry.get("pack_id", "")
-    name = name_map.get((pack_id, kind)) or f"Unknown pack {pack_id[:8]}"
-    version = entry.get("version")
-    version_text = ".".join(map(str, version)) if isinstance(version, list) else str(version)
-    kind_label = "BP" if kind == "bp" else "RP"
-    return f"[{kind_label}] {name} {c_gray(f'({pack_id[:8]} | v{version_text})')}"
+
+def reorder_entry_label(row):
+    kind_text = addon_kind_label(row["items"])
+    details = []
+    for kind in ("bp", "rp"):
+        item = row["items"].get(kind)
+        if not item:
+            continue
+        pack_id = item.get("pack_id") or ""
+        version = version_sort_value(item.get("version"))
+        label = kind.upper()
+        details.append(f"{label} {pack_id[:8]} | v{version}")
+    detail_text = f" {c_gray('(' + '; '.join(details) + ')')}" if details else ""
+    return f"{kind_text} {row['name']}{format_group_versions(row)}{detail_text}"
 
 def move_selected(entries, selected, direction):
     selected = set(selected)
@@ -2158,26 +2922,26 @@ def move_selected(entries, selected, direction):
         selected.add(target)
     return selected
 
-def render_reorder_picker(entries, selected, cursor, kind, name_map):
+def render_reorder_picker(entries, selected, cursor):
     clear_screen()
-    print(c_divider("Reorder world addons"))
-    ui_kv("Items", plural(len(entries), "pack"))
-    ui_kv("Selected", plural(len(selected), "pack"))
+    ui_menu("Reorder world addons", [
+        ("Items", plural(len(entries), "addon")),
+        ("Selected", plural(len(selected), "addon")),
+        ("Mode", "BP and RP sides move together"),
+    ])
     print()
-    for i, entry in enumerate(entries):
-        pointer = ">" if i == cursor else " "
-        mark = "x" if i in selected else " "
-        print(f"  {pointer} [{mark}] {i + 1}. {pack_entry_label(entry, kind, name_map)}")
+    for i, row in enumerate(entries):
+        ui_checkbox_row(i + 1, reorder_entry_label(row), i in selected, i == cursor)
     print()
-    ui_kv("Keys", "↑/↓ move · Space select")
-    ui_kv("Move", "Selected packs move with ↑/↓")
-    ui_kv("Shortcuts", "a all · c clear · Enter save · q cancel")
+    ui_help("↑/↓ move", "Space select", "Enter save")
+    ui_help("a all", "c clear", "q cancel")
 
-def reorder_packs_keyboard(entries, kind, name_map):
+
+def reorder_packs_keyboard(entries):
     cursor = 0
     selected = set()
     while True:
-        render_reorder_picker(entries, selected, cursor, kind, name_map)
+        render_reorder_picker(entries, selected, cursor)
         key = get_key()
         if key == "up":
             if selected:
@@ -2207,18 +2971,20 @@ def reorder_packs_keyboard(entries, kind, name_map):
             print()
             return False
 
-def reorder_packs_text(entries, kind, name_map):
+
+def reorder_packs_text(entries):
     selected = set()
     while True:
-        print(c_divider("Reorder world addons"))
-        ui_kv("Items", plural(len(entries), "pack"))
-        ui_kv("Selected", plural(len(selected), "pack"))
-        for i, entry in enumerate(entries, 1):
-            mark = "x" if i - 1 in selected else " "
-            print(f"  [{mark}] {i}. {pack_entry_label(entry, kind, name_map)}")
+        ui_menu("Reorder world addons", [
+            ("Items", plural(len(entries), "addon")),
+            ("Selected", plural(len(selected), "addon")),
+            ("Mode", "BP and RP sides move together"),
+        ])
+        for i, row in enumerate(entries, 1):
+            ui_checkbox_row(i, reorder_entry_label(row), i - 1 in selected)
         print()
         ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
-        ui_kv("Shortcuts", "u up · d down · a all · c clear · Enter save · q cancel")
+        ui_help("u up", "d down", "a all", "c clear", "Enter save", "q cancel")
         choice = ask("Reorder command", "").lower()
         if choice == "":
             return True
@@ -2252,59 +3018,112 @@ def reorder_packs_text(entries, kind, name_map):
         if not ok:
             ui_status("warn", "Invalid choice.")
 
+
+def split_combined_reorder_entries(entries):
+    split = {"bp": [], "rp": []}
+    for row in entries:
+        for kind in ("bp", "rp"):
+            item = row["items"].get(kind)
+            if item:
+                split[kind].append(item["entry"])
+    return split
+
+
+def save_combined_world_order(world_dir, entries):
+    paths = world_pack_paths(world_dir)
+    split = split_combined_reorder_entries(entries)
+    backups = {}
+    for kind, path in paths.items():
+        if path.exists() or split[kind]:
+            backups[path] = write_text(path, json.dumps(split[kind], indent=2) + "\n")
+    return backups
+
+
+def rollback_reorder_backups(backups):
+    for path, backup in backups.items():
+        rollback_path(path, backup)
+
+
 def reorder_addon_flow(server_dir):
     world_dir = choose_existing_world(server_dir)
     if not world_dir:
         return
-    target = choose_reorder_target(world_dir)
-    if not target:
+    entries = combined_world_reorder_entries(server_dir, world_dir)
+    if not entries:
+        ui_status("warn", f"No world pack JSON entries found in {world_dir.name}.")
         return
-    entries = list(target["entries"])
-    name_map = installed_pack_name_map(server_dir)
     if sys.stdin.isatty():
-        should_save = reorder_packs_keyboard(entries, target["kind"], name_map)
+        should_save = reorder_packs_keyboard(entries)
     else:
-        should_save = reorder_packs_text(entries, target["kind"], name_map)
+        should_save = reorder_packs_text(entries)
     if not should_save:
         ui_status("warn", "Cancelled. Order was not changed.")
         return
-    backup = write_text(target["path"], json.dumps(entries, indent=2) + "\n")
+    backups = save_combined_world_order(world_dir, entries)
     if DRY_RUN:
-        ui_status("warn", f"Dry-run: would save reordered {target['label']} to {target['path']}")
+        ui_status("warn", "Dry-run: would save reordered Behavior Packs and Resource Packs.")
         ui_status("info", "Returning to choose action.")
         return
 
     committed = False
     try:
-        ui_status("ok", f"Saved reordered {target['label']}: {target['path']}")
-        if backup:
-            ui_kv("Backup", backup)
+        ui_status("ok", "Saved reordered Behavior Packs and Resource Packs.")
+        for path, backup in backups.items():
+            ui_kv("Saved", path)
+            if backup:
+                ui_kv("Backup", backup)
         committed = yes_no("Commit this reorder change?", True)
     except KeyboardInterrupt:
-        rollback_path(target["path"], backup)
+        rollback_reorder_backups(backups)
         ui_status("warn", "Reorder cancelled. Restored previous order.")
         raise
     if not committed:
-        rollback_path(target["path"], backup)
+        rollback_reorder_backups(backups)
         ui_status("warn", "Reorder discarded. Restored previous order.")
     else:
         ui_status("ok", "Reorder committed.")
     ui_status("info", "Returning to Choose Action.")
 
+
+
+def group_uninstall_candidates(candidates):
+    groups = {}
+    for index, pack in enumerate(candidates):
+        key = addon_group_key_from_name(pack["name"], pack.get("pack_id") or pack["name"])
+        group = groups.setdefault(key, {
+            "names": [],
+            "items": {},
+            "packs": [],
+            "order": index,
+        })
+        group["names"].append(addon_display_name(pack["name"]))
+        group["items"][pack["kind"]] = pack
+        group["packs"].append(pack)
+        group["order"] = min(group["order"], index)
+
+    result = []
+    for group in groups.values():
+        group["name"] = min(group["names"], key=lambda value: (len(value), value.lower()))
+        result.append(group)
+    return sorted(result, key=lambda group: (group["order"], group["name"].lower()))
+
+
+def addon_group_label(group):
+    return f"{addon_kind_label(group['items'])} {group['name']}{format_group_versions(group)}"
+
+
 def render_checkbox_picker_addons(candidates, selected, cursor):
     clear_screen()
-    print(c_divider("Select installed addons"))
-    ui_kv("Found", plural(len(candidates), "addon"))
-    ui_kv("Selected", plural(len(selected), "addon"))
+    ui_menu("Select installed addons", [
+        ("Found", plural(len(candidates), "addon")),
+        ("Selected", plural(len(selected), "addon")),
+    ])
     print()
-    for i, p in enumerate(candidates):
-        pointer = ">" if i == cursor else " "
-        mark = "x" if i in selected else " "
-        kind_str = "RP" if p["kind"] == "rp" else "BP"
-        print(f"  {pointer} [{mark}] {i + 1}. [{kind_str}] {p['name']} ({p['path'].name})")
+    for i, group in enumerate(candidates):
+        ui_checkbox_row(i + 1, addon_group_label(group), i in selected, i == cursor)
     print()
-    ui_kv("Keys", "↑/↓ move · Space select · Enter remove")
-    ui_kv("Shortcuts", "a all · c clear · q cancel")
+    ui_help("↑/↓ move", "Space select", "Enter remove")
+    ui_help("a all", "c clear", "q cancel")
 
 def choose_addons_keyboard(candidates):
     if not candidates:
@@ -2337,16 +3156,15 @@ def choose_addons_keyboard(candidates):
 def choose_addons_text(candidates):
     selected = set()
     while True:
-        print(c_divider("Select installed addons"))
-        ui_kv("Found", plural(len(candidates), "addon"))
-        ui_kv("Selected", plural(len(selected), "addon"))
-        for i, p in enumerate(candidates, 1):
-            mark = "x" if i in selected else " "
-            kind_str = "RP" if p["kind"] == "rp" else "BP"
-            print(f"  [{mark}] {i}. [{kind_str}] {p['name']} ({p['path'].name})")
+        ui_menu("Select installed addons", [
+            ("Found", plural(len(candidates), "addon")),
+            ("Selected", plural(len(selected), "addon")),
+        ])
+        for i, group in enumerate(candidates, 1):
+            ui_checkbox_row(i, addon_group_label(group), i in selected)
         print()
         ui_kv("Input", "Toggle numbers, example: 1 or 1,3")
-        ui_kv("Shortcuts", "a all · c clear · Enter continue")
+        ui_help("a all", "c clear", "Enter continue")
 
         choice = ask("Choose addon to delete", "")
         if choice == "":
@@ -2408,29 +3226,32 @@ def uninstall_addon_flow(server_dir, force_delete=False):
     else:
         ui_status("warn", "Using folder/name order because no world was selected.")
     
+    grouped_candidates = group_uninstall_candidates(candidates)
     if sys.stdin.isatty():
-        to_remove = choose_addons_keyboard(candidates)
+        selected_groups = choose_addons_keyboard(grouped_candidates)
     else:
-        to_remove = choose_addons_text(candidates)
-        
-    if not to_remove:
+        selected_groups = choose_addons_text(grouped_candidates)
+
+    if not selected_groups:
         ui_status("warn", "Cancelled. Nothing was removed.")
         return
-    
+    to_remove = [pack for group in selected_groups for pack in group["packs"]]
+
     delete_label = "permanently deleted" if force_delete else "moved to backup folders"
     if force_delete:
-        print(c_divider(c_red("Warning: permanent deletion")))
-        ui_status("err", "Selected addon folders will be deleted permanently.")
-        ui_status("err", "Recovery is only possible from your own backups.")
+        ui_panel("Warning: permanent deletion", [
+            f"{ui_badge('DANGER', 'danger')} Selected addon folders will be deleted permanently.",
+            "Recovery is only possible from your own backups.",
+        ], kind="danger")
     else:
-        print(c_divider("Uninstall preview"))
         backup_root = Path(__file__).resolve().parent / ".temp-addonInstaller" / "backups" / clean_name(server_dir.name)
-        ui_status("info", "Selected addon folders will be moved to backups.")
-        ui_kv("Backup root", backup_root)
-    print(f"\n{c_bold('Selected for removal')}")
-    for i, pack in enumerate(to_remove, 1):
-        kind_str = c_cyan("RP") if pack["kind"] == "rp" else c_cyan("BP")
-        print(f"  {c_red('x')} {i}. [{kind_str}] {c_bold(pack['name'])}")
+        ui_panel("Uninstall preview", [
+            f"{ui_badge('INFO', 'info')} Selected addon folders will be moved to backups.",
+            ("Backup root", backup_root),
+        ])
+    print(c_divider("Selected for removal"))
+    for i, group in enumerate(selected_groups, 1):
+        print(f"  {ui_badge(str(i), 'danger')} {c_bold(addon_group_label(group))}")
     
     confirm = ask(f"\nType {c_bold('DELETE')} to confirm, or press Enter to cancel")
     if confirm != "DELETE":
@@ -2438,19 +3259,20 @@ def uninstall_addon_flow(server_dir, force_delete=False):
         return
 
     worlds_dir = server_dir / "worlds"
-    existing_worlds = sorted([p for p in worlds_dir.iterdir() if p.is_dir()]) if worlds_dir.exists() else []
+    existing_worlds = visible_folders(worlds_dir)
     
     total = len(to_remove)
+    total_addons = len(selected_groups)
     removed_names = []
-    
+
     action_label = "Deleting" if force_delete else "Removing"
-    print(c_divider(f"{action_label} {total} addon(s)"))
+    print(c_divider(f"{action_label} {plural(total_addons, 'addon')} ({plural(total, 'folder')})"))
     for idx, pack in enumerate(to_remove, 1):
         pack_path = pack["path"]
         kind_label = "RP" if pack["kind"] == "rp" else "BP"
         backup = uninstall_backup_path(server_dir, pack_path, pack["kind"])
         
-        print(f"\n{c_bold(f'[{idx}/{total}]')} {pack['name']} {c_gray(f'({kind_label})')}")
+        print(f"\n  {ui_badge(f'{idx}/{total}', 'accent')} {c_bold(pack['name'])} {ui_badge(kind_label, 'info')}")
         ui_kv("Folder", pack_path)
         if not force_delete:
             ui_kv("Backup", backup)
@@ -2483,11 +3305,12 @@ def uninstall_addon_flow(server_dir, force_delete=False):
         removed_names.append(f"[{kind_label}] {pack['name']}")
     
     # Final summary
-    print(c_divider("Uninstall complete"))
     total_label = "deleted" if force_delete else "removed"
-    ui_kv(f"Total {total_label}", plural(total, "addon"))
-    for name in removed_names:
-        ui_status("ok", name)
+    ui_panel("Uninstall complete", [
+        (f"Total {total_label}", f"{plural(total_addons, 'addon')} ({plural(total, 'folder')})"),
+    ], kind="ok")
+    for group in selected_groups:
+        ui_status("ok", addon_group_label(group))
     print(c_divider())
     ui_status("ok", "Restart bedrock_server to apply changes.")
     print()
@@ -2501,6 +3324,7 @@ def parse_args():
         action="store_true",
         help="Permanently delete addon folders during uninstall instead of moving them to centralized backups.",
     )
+    parser.add_argument("--inspect", metavar="PATH", help="Inspect addon archive contents without installing.")
     return parser.parse_args()
 
 
@@ -2516,10 +3340,14 @@ def main():
     args = parse_args()
     DRY_RUN = args.dry_run
 
-    log_file = setup_logging(DRY_RUN)
+    log_file = setup_logging(DRY_RUN or bool(args.inspect))
     _enable_colors()
     if DRY_RUN:
         log.info("DRY-RUN mode enabled")
+
+    if args.inspect:
+        inspect_archive(Path(args.inspect).expanduser().resolve())
+        return
 
     ui_banner(log_file, args.force_delete)
 
@@ -2527,15 +3355,17 @@ def main():
     ui_step(1, "Choose server", "Pick Bedrock server folder containing server.properties.")
     server_dir = choose_server_dir()
     ui_status("ok", f"Server selected: {server_dir}")
+    print_server_info(server_dir)
 
     while True:
         # Step 2: Choose action
         ui_step(2, "Choose action")
+        print_installed_addon_overview(server_dir, default_world_dir(server_dir))
+        print()
         ui_option("1", "Install addon", "copy packs and enable them in a world")
         ui_option("2", "Uninstall addon", "remove world refs and back up pack folders")
         ui_option("3", "Reorder world addons", "adjust BP/RP load order")
         ui_option("0", "Exit")
-        print_installed_addon_overview(server_dir, default_world_dir(server_dir))
         while True:
             action_choice = ask("Choose action", "1", allow_exit=False)
             if is_exit_choice(action_choice):
@@ -2588,6 +3418,8 @@ def main():
             packs, worlds = process_archive(archive, server_dir, batch_context)
             installed.extend(packs)
             imported_worlds.extend(worlds)
+            for world in worlds:
+                config_changes.extend(world.get("config_changes", []))
             archive_results.append((archive.name, packs, worlds))
 
         if not installed:
