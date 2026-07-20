@@ -2619,6 +2619,13 @@ def _tick(cond: bool) -> str:
     return "[✓]" if cond else "[ ]"
 
 
+def ui_pack_presence(label: str, included: bool) -> None:
+    """Print pack presence with a green label when included."""
+    label_text = c_green(label) if included else c_gray(label)
+    value = _tick(True) if included else c_gray("not included")
+    print(f"  {label_text}: {value}")
+
+
 def print_summary(archive_results, dep_missing) -> None:
     """Print a separate summary for each addon/archive."""
     for archive_name, packs, worlds in archive_results:
@@ -2641,7 +2648,7 @@ def print_summary(archive_results, dep_missing) -> None:
         # BP Included
         bp_packs = [x for x in packs if x["kind"] == "bp"]
         has_bp = len(bp_packs) > 0
-        ui_kv("Behavior pack", _tick(True) if has_bp else c_gray("not included"))
+        ui_pack_presence("Behavior Pack", has_bp)
         if has_bp:
             for p in bp_packs:
                 ui_kv("  Location", p["path"])
@@ -2650,7 +2657,7 @@ def print_summary(archive_results, dep_missing) -> None:
         # RP Included
         rp_packs = [x for x in packs if x["kind"] == "rp"]
         has_rp = len(rp_packs) > 0
-        ui_kv("Resource pack", _tick(True) if has_rp else c_gray("not included"))
+        ui_pack_presence("Resource Pack", has_rp)
         if has_rp:
             for p in rp_packs:
                 ui_kv("  Location", p["path"])
@@ -2747,6 +2754,40 @@ def world_pack_order_maps(world_dir):
         }
     return order_maps
 
+def find_world_local_pack_path(world_dir: Path, pack_id: str, kind: str):
+    """Find a pack bundled inside worlds/<world>/behavior_packs or resource_packs."""
+    folder_name = "resource_packs" if kind == "rp" else "behavior_packs"
+    base = world_dir / folder_name
+    if not pack_id or not base.exists():
+        return None
+    for pack_dir in sorted([p for p in base.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+        manifest_path = pack_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = load_json(manifest_path)
+        except Exception:
+            continue
+        if manifest.get("header", {}).get("uuid") == pack_id:
+            return pack_dir
+    return None
+
+
+def pack_source_label(world_dir: Path, pack_id: str, kind: str) -> str:
+    return "from imported world" if find_world_local_pack_path(world_dir, pack_id, kind) else ""
+
+
+def source_suffix_for_items(items) -> str:
+    sources = {
+        item.get("source")
+        for item in items.values()
+        if item.get("source")
+    }
+    if not sources:
+        return ""
+    return f" {c_gray('(' + ', '.join(sorted(sources)) + ')')}"
+
+
 def sort_addons_for_uninstall(candidates, world_dir=None):
     """Sort uninstall candidates by world pack-stack order when a world is selected."""
     if not world_dir:
@@ -2830,6 +2871,7 @@ def world_ordered_addon_rows(server_dir, world_dir):
                 "pack_id": pack_id,
                 "name": name,
                 "version": version,
+                "source": pack_source_label(world_dir, pack_id, kind),
             }
             group["orders"].append((index, kind_order))
 
@@ -2873,7 +2915,7 @@ def print_installed_addon_overview(server_dir, world_dir=None):
             ], kind="ok")
             for index, row in enumerate(rows, 1):
                 kind_text = addon_kind_label(row["items"])
-                print(f"  {ui_badge(str(index), 'muted')} {kind_text} {row['name']}{format_group_versions(row)}")
+                print(f"  {ui_badge(str(index), 'muted')} {kind_text} {row['name']}{format_group_versions(row)}{source_suffix_for_items(row['items'])}")
             return
         ui_panel("Current addon status", [
             ("World", world_dir.name),
@@ -2933,6 +2975,7 @@ def combined_world_reorder_entries(server_dir, world_dir):
                 "pack_id": pack_id,
                 "name": name,
                 "version": entry.get("version"),
+                "source": pack_source_label(world_dir, pack_id, kind),
             }
             group["orders"].append((index, 0 if kind == "bp" else 1))
 
@@ -2958,7 +3001,7 @@ def reorder_entry_label(row):
         label = kind.upper()
         details.append(f"{label} {pack_id[:8]} | v{version}")
     detail_text = f" {c_gray('(' + '; '.join(details) + ')')}" if details else ""
-    return f"{kind_text} {row['name']}{format_group_versions(row)}{detail_text}"
+    return f"{kind_text} {row['name']}{format_group_versions(row)}{source_suffix_for_items(row['items'])}{detail_text}"
 
 def move_selected(entries, selected, direction):
     selected = set(selected)
