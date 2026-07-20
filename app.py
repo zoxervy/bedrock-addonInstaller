@@ -2360,10 +2360,7 @@ def world_template_count(pack_items) -> int:
 
 
 def format_detected_content(bp_count: int, rp_count: int, template_count: int, world_count: int) -> str:
-    parts = [f"{bp_count} BP", f"{rp_count} RP"]
-    if template_count:
-        parts.append(plural(template_count, "world template"))
-    parts.append(plural(world_count, "world"))
+    parts = [f"{bp_count} BP", f"{rp_count} RP", plural(world_count, "world")]
     return ", ".join(parts)
 
 
@@ -2388,9 +2385,6 @@ def print_pack_kind_notice(pack_items, batch_available_ids=None) -> None:
         for dep in manifest_dependencies(manifest)
     ]
     matched_deps = [dep for dep in dependencies if dep["uuid"] in batch_available_ids]
-    if world_template_count(pack_items):
-        ui_subitem(c_gray("World template:"), "metadata/preset for a template; it is not installed as BP/RP")
-        ui_subitem(c_gray("World:"), "playable folder imported into server worlds/ when selected")
     if bp_count and not rp_count and not matched_deps:
         ui_subitem(c_warn("Note:"), "Install companion resource pack separately if needed.")
 
@@ -3207,7 +3201,7 @@ def addon_group_label(group):
 
 def render_checkbox_picker_addons(candidates, selected, cursor):
     clear_screen()
-    ui_menu("Select installed addons", [
+    ui_menu("Select addon to uninstall", [
         ("Found", plural(len(candidates), "addon")),
         ("Selected", plural(len(selected), "addon")),
     ])
@@ -3249,7 +3243,7 @@ def choose_addons_keyboard(candidates):
 def choose_addons_text(candidates):
     selected = set()
     while True:
-        ui_menu("Select installed addons", [
+        ui_menu("Select addon to uninstall", [
             ("Found", plural(len(candidates), "addon")),
             ("Selected", plural(len(selected), "addon")),
         ])
