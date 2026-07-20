@@ -123,9 +123,12 @@ def clean_name(name):
 
 
 def clean_pack_title(name: str) -> str:
-    """Return a readable pack title without color codes, version text, or BP/RP suffixes."""
+    """Return a readable pack title without color codes, comments, version text, or BP/RP suffixes."""
     text = strip_bedrock_formatting(name).replace("_", " ")
+    text = re.sub(r"\s+#{2,}.*$", "", text).strip()
+    text = re.sub(r"[\[\(]\s*v?\d+(?:\.\d+){1,3}\s*[\]\)]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[\[\(]\s*(bp|rp|resource|resources|behavior|behaviour|texture|textures|addon|add-on|pack|world)\s*[\]\)]", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\[\(]\s*[\]\)]", " ", text)
     text = re.sub(r"\b(resource|resources|behavior|behaviour|texture|textures)\s+pack\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\badd-?on\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"(?:\s*[-–—|:]\s*)?\b(bp|rp|resource|resources|behavior|behaviour|texture|textures)\s+(\d+)\b", r" \2", text, flags=re.IGNORECASE)
@@ -140,6 +143,52 @@ def safe_folder_component(name: str) -> str:
     cleaned = "".join(c if c.isalnum() or c in " ._-&()[]" else " " for c in strip_bedrock_formatting(name))
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._-&")
     return cleaned or "Pack"
+
+
+def source_stem(source_name) -> str:
+    """Return an addon archive stem without supported archive extensions."""
+    name = Path(str(source_name).split("!", 1)[0]).name
+    lower_name = name.lower()
+    for ext in sorted(TAR_EXTS | PACK_EXTS, key=len, reverse=True):
+        if lower_name.endswith(ext):
+            return name[:-len(ext)]
+    return Path(name).stem
+
+
+def source_title(source_name) -> str:
+    """Build a readable addon title from the archive file name."""
+    text = source_stem(source_name)
+    text = re.sub(r"\s+#{2,}.*$", "", text).strip()
+    text = re.sub(r"\bv?\d+(?:\.\d+){1,3}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[._]+", " ", text)
+    text = re.sub(r"\s*[-–—]+\s*", " ", text)
+    text = re.sub(r"\b(?:r\d+[a-z0-9]*|r?[a-z]+\d+[a-z0-9]*)\b\s*$", "", text, flags=re.IGNORECASE)
+    return clean_pack_title(text)
+
+
+def title_compare_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+
+def title_for_pack(pack_dir: Path, manifest: dict, source_name=None) -> str:
+    """Choose the best readable title, preferring the addon file name."""
+    manifest_title = clean_pack_title(manifest_display_name(pack_dir, manifest))
+    if not source_name:
+        return manifest_title
+
+    file_title = source_title(source_name)
+    if not file_title or file_title == "Pack":
+        return manifest_title
+
+    manifest_key = title_compare_key(manifest_title)
+    file_key = title_compare_key(file_title)
+    if manifest_key.startswith(file_key + " "):
+        return manifest_title
+    if file_key.startswith(manifest_key + " "):
+        extra = file_key[len(manifest_key):].strip()
+        if re.fullmatch(r"r?[a-z0-9]*\d+[a-z0-9]*", extra):
+            return manifest_title
+    return file_title
 
 
 def manifest_version_label(manifest: dict) -> str:
@@ -220,8 +269,8 @@ def manifest_display_name(pack_dir: Path, manifest: dict) -> str:
     return resolve_pack_text(pack_dir, raw_name) or raw_name
 
 
-def pack_folder_name(pack_dir, manifest, kind=None):
-    name = clean_pack_title(manifest_display_name(Path(pack_dir), manifest))
+def pack_folder_name(pack_dir, manifest, kind=None, source_name=None):
+    name = title_for_pack(Path(pack_dir), manifest, source_name)
     version = manifest_version_label(manifest)
     suffix = f" v{version}" if version != "unknown" else ""
     if kind in ("rp", "bp"):
@@ -243,7 +292,7 @@ def unique_world_pack_folder(base: Path, desired_name: str, current: Path) -> Pa
         index += 1
 
 
-def normalize_world_local_pack_folders(world_dir: Path):
+def normalize_world_local_pack_folders(world_dir: Path, source_name=None):
     """Rename imported world-local BP/RP folders from generic bp0/rp0 to readable pack names."""
     if DRY_RUN:
         return []
@@ -263,7 +312,7 @@ def normalize_world_local_pack_folders(world_dir: Path):
                 continue
             if kind not in detect_pack_kinds(manifest):
                 continue
-            desired_name = pack_folder_name(pack_dir, manifest, kind)
+            desired_name = pack_folder_name(pack_dir, manifest, kind, source_name)
             dest = unique_world_pack_folder(base, desired_name, pack_dir)
             if dest.resolve() == pack_dir.resolve():
                 continue
@@ -1726,7 +1775,7 @@ def choose_archives(server_dir):
 
 
 
-def install_pack_dir(pack_dir, manifest, server_dir):
+def install_pack_dir(pack_dir, manifest, server_dir, source_name=None):
     kinds = detect_pack_kinds(manifest)
     if not kinds:
         log.info("Skip non-pack manifest %s: %s", pack_dir, manifest_kind_label(manifest))
@@ -1737,7 +1786,7 @@ def install_pack_dir(pack_dir, manifest, server_dir):
     # Validate UUID format before use
     validate_uuid(pack_id, context=str(pack_dir))
     version = version_array(header.get("version"))
-    pack_name = manifest_display_name(pack_dir, manifest)
+    pack_name = title_for_pack(Path(pack_dir), manifest, source_name)
     log.info("Pack found: %s | kind=%s | uuid=%s | version=%s",
              pack_name, kinds, pack_id, version)
 
@@ -1748,7 +1797,7 @@ def install_pack_dir(pack_dir, manifest, server_dir):
             base.mkdir(parents=True, exist_ok=True)
         else:
             action(f"Ensure dir: {base}")
-        dest = base / pack_folder_name(pack_dir, manifest, kind)
+        dest = base / pack_folder_name(pack_dir, manifest, kind, source_name)
         replaced_path = None
         replaced_backup = None
         existing_dest = find_installed_pack_path(server_dir, pack_id, kind)
@@ -1820,7 +1869,7 @@ def choose_world_to_replace(existing_worlds):
         ui_status("warn", f"Choose a number 0-{len(existing_worlds)}.")
 
 
-def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, server_dir: Path):
+def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, server_dir: Path, source_name=None):
     suggested_name = next_bedrock_world_name(worlds_dir)
     if suggested_name != default_name:
         ui_kv("Suggested folder", suggested_name)
@@ -1833,7 +1882,7 @@ def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, se
         break
 
     backup = safe_copytree(src_world, dest)
-    renamed_local_packs = normalize_world_local_pack_folders(dest)
+    renamed_local_packs = normalize_world_local_pack_folders(dest, source_name)
     record = {
         "path": dest,
         "backup": backup,
@@ -1856,7 +1905,7 @@ def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, se
     return record
 
 
-def import_world_replace(src_world: Path, existing_worlds):
+def import_world_replace(src_world: Path, existing_worlds, source_name=None):
     dest = choose_world_to_replace(existing_worlds)
     if dest is None:
         ui_status("warn", "Skipped world import.")
@@ -1869,7 +1918,7 @@ def import_world_replace(src_world: Path, existing_worlds):
         return None
 
     backup = replace_copytree(src_world, dest)
-    renamed_local_packs = normalize_world_local_pack_folders(dest)
+    renamed_local_packs = normalize_world_local_pack_folders(dest, source_name)
     return {
         "path": dest,
         "backup": backup,
@@ -1882,7 +1931,7 @@ def import_world_replace(src_world: Path, existing_worlds):
     }
 
 
-def import_world_dir(src_world, server_dir):
+def import_world_dir(src_world, server_dir, source_name=None):
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
         worlds_dir.mkdir(parents=True, exist_ok=True)
@@ -1906,9 +1955,9 @@ def import_world_dir(src_world, server_dir):
             ui_status("warn", "Skipped world import.")
             return None
         if choice == "1":
-            return import_world_as_new(src_world, worlds_dir, default_name, server_dir)
+            return import_world_as_new(src_world, worlds_dir, default_name, server_dir, source_name)
         if choice == "2" and existing_worlds:
-            return import_world_replace(src_world, existing_worlds)
+            return import_world_replace(src_world, existing_worlds, source_name)
         valid = "0, 1, or 2" if existing_worlds else "0 or 1"
         ui_status("warn", f"Choose {valid}.")
 
@@ -1990,7 +2039,7 @@ def load_manifests_from_archive(archive: Path, max_depth: int = 10):
     return manifests
 
 
-def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Path):
+def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Path, source_name=None):
     """Simulate pack installation from manifest without full archive extraction."""
     installed = []
     header = manifest.get("header", {})
@@ -2008,14 +2057,14 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
         virtual_pack_dir = Path(manifest_name).parent
         if str(virtual_pack_dir) in ("", "."):
             virtual_pack_dir = Path(archive_stem_from_manifest(manifest_name))
-        dest = base / pack_folder_name(virtual_pack_dir, manifest, kind)
+        dest = base / pack_folder_name(virtual_pack_dir, manifest, kind, source_name)
         log.info("Dry-run would install: %s -> %s", manifest_name, dest)
         installed.append({
             "pack_id": pack_id,
             "version": version,
             "path": str(dest),
             "backup": None,
-            "name": header.get("name", virtual_pack_dir.name),
+            "name": title_for_pack(virtual_pack_dir, manifest, source_name),
             "kind": kind,
             "dependencies": manifest_dependencies(manifest),
         })
@@ -2161,6 +2210,7 @@ def _virtual_pack_dir(archive: Path, manifest_name: str) -> Path:
 
 def manifest_pack_records(archive: Path, manifest_items, server_dir: Path):
     """Convert pre-scanned manifest items into per-kind install records."""
+    source_name = archive.name
     records = []
     for manifest_name, manifest in manifest_items:
         header = manifest.get("header", {})
@@ -2173,10 +2223,10 @@ def manifest_pack_records(archive: Path, manifest_items, server_dir: Path):
         except Exception:
             version = header.get("version")
         pack_dir = _virtual_pack_dir(archive, str(manifest_name))
-        pack_name = manifest_display_name(pack_dir, manifest)
+        pack_name = title_for_pack(pack_dir, manifest, source_name)
         for kind in kinds:
             base = server_dir / ("resource_packs" if kind == "rp" else "behavior_packs")
-            dest = base / pack_folder_name(pack_dir, manifest, kind)
+            dest = base / pack_folder_name(pack_dir, manifest, kind, source_name)
             records.append({
                 "archive": archive,
                 "manifest_name": str(manifest_name),
@@ -2363,7 +2413,7 @@ def process_archive(archive, server_dir, batch_context=None):
         ui_phase("Simulate install")
         for manifest_name, manifest in manifest_items:
             try:
-                result = dry_run_install_manifest(manifest_name, manifest, server_dir)
+                result = dry_run_install_manifest(manifest_name, manifest, server_dir, archive.name)
                 for pack in result:
                     kind_label = "RP" if pack["kind"] == "rp" else "BP"
                     ui_subitem(c_ok(f"{kind_label}"), f"{pack['name']} {c_gray('-> ' + short_path(pack['path']))}")
@@ -2395,7 +2445,7 @@ def process_archive(archive, server_dir, batch_context=None):
         ui_phase("Install packs")
         for manifest_path, manifest in manifest_items:
             try:
-                result = install_pack_dir(manifest_path.parent, manifest, server_dir)
+                result = install_pack_dir(manifest_path.parent, manifest, server_dir, archive.name)
                 for pack in result:
                     kind_label = "RP" if pack["kind"] == "rp" else "BP"
                     folder = Path(pack["path"]).parent.name + "/" + Path(pack["path"]).name
@@ -2411,7 +2461,7 @@ def process_archive(archive, server_dir, batch_context=None):
             ui_phase("World imports")
         for world_dir in world_dirs:
             if yes_no(f"Template/world detected: {world_dir.name}. Import world?", True):
-                imported = import_world_dir(world_dir, server_dir)
+                imported = import_world_dir(world_dir, server_dir, archive.name)
                 if imported:
                     imported_worlds.append(imported)
     finally:
