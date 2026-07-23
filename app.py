@@ -9,7 +9,7 @@ import sys
 import tarfile
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 import re
 
@@ -50,6 +50,28 @@ def safe_child_path(base: Path, name: str, label: str) -> Path:
     if not is_within_dir(base, target):
         raise RuntimeError(f"Path traversal blocked: {label}")
     return target
+
+
+def normalized_zip_member_name(name: str) -> str:
+    """Return a ZIP member name with portable archive separators."""
+    return str(name).replace("\\", "/")
+
+
+def zip_member_path(name: str) -> PurePosixPath:
+    """Return a normalized ZIP member path for inspection and extraction."""
+    return PurePosixPath(normalized_zip_member_name(name))
+
+
+def safe_language_code(language: str) -> Optional[str]:
+    """Return a plain Bedrock language identifier, rejecting path-like values."""
+    value = language.strip()
+    if not value or value in {".", ".."}:
+        return None
+    if any(char in value for char in ("/", "\\", ":")):
+        return None
+    if Path(value).is_absolute() or value.startswith(("~", "\\\\")):
+        return None
+    return value
 
 
 def safe_world_name(name: str) -> str:
@@ -242,7 +264,11 @@ def language_files_for_pack(pack_dir: Path) -> list[Path]:
             for language in languages:
                 if not isinstance(language, str):
                     continue
-                path = texts_dir / f"{language}.lang"
+                language_code = safe_language_code(language)
+                if language_code is None:
+                    log.warning("Ignore unsafe languages.json entry in %s: %r", pack_dir, language)
+                    continue
+                path = safe_child_path(texts_dir, f"{language_code}.lang", language)
                 if path.exists() and path not in files:
                     files.append(path)
 
@@ -332,16 +358,50 @@ def manifest_dependencies(manifest):
     return deps
 
 
+def normalized_dependency_version(version):
+    """Return a comparable dependency version, or None for UUID-only dependencies."""
+    if version is None:
+        return None
+    try:
+        return version_array(version)
+    except Exception:
+        return version
+
+
+def pack_version_index(packs):
+    """Index available pack versions by UUID for dependency validation."""
+    index = {}
+    for pack in packs:
+        pack_id = pack.get("pack_id")
+        if not pack_id:
+            continue
+        version = normalized_dependency_version(pack.get("version"))
+        index.setdefault(pack_id, set()).add(tuple(version) if isinstance(version, list) else version)
+    return index
+
+
+def dependency_status(dep, available_versions):
+    """Return found, version-mismatch, or missing for one manifest dependency."""
+    versions = available_versions.get(dep["uuid"])
+    if not versions:
+        return "missing"
+    required = normalized_dependency_version(dep.get("version"))
+    if required is None:
+        return "found"
+    required_key = tuple(required) if isinstance(required, list) else required
+    return "found" if required_key in versions else "version_mismatch"
+
+
 def check_dependencies(installed, available_packs=None):
-    """Return manifest dependencies not found in installed/server packs."""
-    available_packs = available_packs or installed
-    installed_ids = {p.get("pack_id") for p in available_packs if p.get("pack_id")}
-    missing = []
+    """Return missing or version-mismatched manifest dependencies."""
+    available_versions = pack_version_index(available_packs or installed)
+    issues = []
     for pack in installed:
         for dep in pack.get("dependencies", []):
-            if dep["uuid"] not in installed_ids:
-                missing.append((pack, dep))
-    return missing
+            status = dependency_status(dep, available_versions)
+            if status != "found":
+                issues.append((pack, dep, status))
+    return issues
 
 
 def archive_stem_from_manifest(manifest_name: str) -> str:
@@ -830,8 +890,8 @@ def read_server_level_name(server_dir: Path) -> Optional[str]:
     return None
 
 
-def set_server_level_name(server_dir: Path, world_name: str):
-    """Set server.properties level-name and return rollback backup info."""
+def set_server_level_name(server_dir: Path, world_name: str, on_prepared=None):
+    """Set server.properties level-name and register its rollback backup first."""
     props = server_dir / "server.properties"
     content = props.read_text(encoding="utf-8", errors="ignore") if props.exists() else ""
     lines = content.splitlines()
@@ -845,7 +905,7 @@ def set_server_level_name(server_dir: Path, world_name: str):
             new_lines.append(line)
     if not found:
         new_lines.append(f"level-name={world_name}")
-    return props, write_text(props, "\n".join(new_lines) + "\n")
+    return props, write_text(props, "\n".join(new_lines) + "\n", on_prepared)
 
 
 def server_binary_name() -> str:
@@ -1161,8 +1221,8 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
         copied = 0
         log.info("Extract zip: %s (%d files)", zip_path.name, total)
         for member in members:
-            safe_name = member.filename.replace("/", os.sep).replace("\\", os.sep)
-            target = safe_child_path(dest, safe_name, member.filename)
+            member_path = zip_member_path(member.filename)
+            target = safe_child_path(dest, str(member_path), member.filename)
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -1171,7 +1231,7 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
                 shutil.copyfileobj(src, dst)
             copied += 1
             if total and (copied == total or copied % 25 == 0):
-                print_progress(copied, total, Path(member.filename).name)
+                print_progress(copied, total, member_path.name)
         pass  # progress bar already writes its own newline
 
 
@@ -1231,24 +1291,30 @@ def copytree_with_progress(src: Path, dest: Path) -> None:
         log.info("Copy complete: %s → %s (%d files)", src, dest, total)
 
 
-def safe_copytree(src: Path, dest: Path):
-    """Copy src directory to dest with backup, disk check, and progress bar."""
+def safe_copytree(src: Path, dest: Path, on_prepared=None):
+    """Copy src directory after registering its backup with the caller's transaction."""
     backup = None
     if dest.exists():
         if yes_no(f"Folder {dest.name} already exists. Replace?", True):
             backup = backup_existing(dest)
+            if on_prepared:
+                on_prepared(backup)
             log.info("Remove: %s", dest)
             if not DRY_RUN:
                 shutil.rmtree(dest)
         else:
             raise RuntimeError("Cancelled because the pack/world folder already exists.")
+    elif on_prepared:
+        on_prepared(None)
     copytree_with_progress(src, dest)
     return backup
 
 
-def replace_copytree(src: Path, dest: Path):
-    """Replace an existing directory after caller has confirmed the overwrite."""
+def replace_copytree(src: Path, dest: Path, on_prepared=None):
+    """Replace an existing directory after registering its backup with the transaction."""
     backup = backup_existing(dest)
+    if on_prepared:
+        on_prepared(backup)
     log.info("Remove: %s", dest)
     if not DRY_RUN and dest.exists():
         shutil.rmtree(dest)
@@ -1256,10 +1322,13 @@ def replace_copytree(src: Path, dest: Path):
     return backup
 
 
-def write_text(path, content):
+def write_text(path, content, on_prepared=None):
+    """Write text after making any rollback backup visible to the caller."""
     backup = None
     if path.exists():
         backup = backup_existing(path)
+    if on_prepared:
+        on_prepared(backup)
     log.info("Write: %s", path)
     if not DRY_RUN:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1775,7 +1844,19 @@ def choose_archives(server_dir):
 
 
 
-def install_pack_dir(pack_dir, manifest, server_dir, source_name=None):
+def validate_install_manifest(manifest: dict, context: str) -> bool:
+    """Validate installable manifest fields before filesystem changes begin."""
+    kinds = detect_pack_kinds(manifest)
+    if not kinds:
+        return False
+    header = manifest.get("header", {})
+    validate_uuid(header.get("uuid"), context=context)
+    version_array(header.get("version"))
+    return True
+
+
+def install_pack_dir(pack_dir, manifest, server_dir, source_name=None, transaction_installed=None):
+    """Install one manifest and register each mutable destination before copying."""
     kinds = detect_pack_kinds(manifest)
     if not kinds:
         log.info("Skip non-pack manifest %s: %s", pack_dir, manifest_kind_label(manifest))
@@ -1783,12 +1864,10 @@ def install_pack_dir(pack_dir, manifest, server_dir, source_name=None):
 
     header = manifest.get("header", {})
     pack_id = header.get("uuid")
-    # Validate UUID format before use
     validate_uuid(pack_id, context=str(pack_dir))
     version = version_array(header.get("version"))
     pack_name = title_for_pack(Path(pack_dir), manifest, source_name)
-    log.info("Pack found: %s | kind=%s | uuid=%s | version=%s",
-             pack_name, kinds, pack_id, version)
+    log.info("Pack found: %s | kind=%s | uuid=%s | version=%s", pack_name, kinds, pack_id, version)
 
     installed = []
     for kind in kinds:
@@ -1798,35 +1877,36 @@ def install_pack_dir(pack_dir, manifest, server_dir, source_name=None):
         else:
             action(f"Ensure dir: {base}")
         dest = base / pack_folder_name(pack_dir, manifest, kind, source_name)
-        replaced_path = None
-        replaced_backup = None
-        existing_dest = find_installed_pack_path(server_dir, pack_id, kind)
-        if existing_dest and existing_dest.resolve() != dest.resolve():
-            if yes_no(f"Pack UUID already exists in {existing_dest.name}. Replace and rename folder?", True):
-                replaced_path = existing_dest
-                replaced_backup = backup_existing(existing_dest)
-                log.info("Remove old pack folder after rename: %s", existing_dest)
-                if not DRY_RUN:
-                    shutil.rmtree(existing_dest)
-            else:
-                raise RuntimeError("Cancelled because the pack UUID is already installed.")
         record = {
             "pack_id": pack_id,
             "version": version,
             "path": str(dest),
             "backup": None,
-            "replaced_path": str(replaced_path) if replaced_path else None,
-            "replaced_backup": str(replaced_backup) if replaced_backup else None,
+            "replaced_path": None,
+            "replaced_backup": None,
             "name": pack_name,
             "kind": kind,
             "dependencies": manifest_dependencies(manifest),
         }
-        # Track the replacement before copying the new pack. If safe_copytree fails
-        # after an old UUID-matching folder was moved/removed, rollback_install()
-        # can still restore replaced_path from replaced_backup.
         installed.append(record)
-        backup = safe_copytree(pack_dir, dest)
-        record["backup"] = str(backup) if backup else None
+        if transaction_installed is not None:
+            transaction_installed.append(record)
+
+        existing_dest = find_installed_pack_path(server_dir, pack_id, kind)
+        if existing_dest and existing_dest.resolve() != dest.resolve():
+            if not yes_no(f"Pack UUID already exists in {existing_dest.name}. Replace and rename folder?", True):
+                raise RuntimeError("Cancelled because the pack UUID is already installed.")
+            replaced_backup = backup_existing(existing_dest)
+            record["replaced_path"] = str(existing_dest)
+            record["replaced_backup"] = str(replaced_backup) if replaced_backup else None
+            log.info("Remove old pack folder after rename: %s", existing_dest)
+            if not DRY_RUN:
+                shutil.rmtree(existing_dest)
+
+        def track_destination_backup(backup):
+            record["backup"] = str(backup) if backup else None
+
+        safe_copytree(pack_dir, dest, track_destination_backup)
     return installed
 
 
@@ -1869,7 +1949,15 @@ def choose_world_to_replace(existing_worlds):
         ui_status("warn", f"Choose a number 0-{len(existing_worlds)}.")
 
 
-def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, server_dir: Path, source_name=None):
+def import_world_as_new(
+    src_world: Path,
+    worlds_dir: Path,
+    default_name: str,
+    server_dir: Path,
+    source_name=None,
+    transaction_worlds=None,
+    transaction_config_changes=None,
+):
     suggested_name = next_bedrock_world_name(worlds_dir)
     if suggested_name != default_name:
         ui_kv("Suggested folder", suggested_name)
@@ -1881,22 +1969,33 @@ def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, se
             continue
         break
 
-    backup = safe_copytree(src_world, dest)
-    renamed_local_packs = normalize_world_local_pack_folders(dest, source_name)
     record = {
         "path": dest,
-        "backup": backup,
+        "backup": None,
         "action": "created",
         "source": src_world.name,
-        "renamed_local_packs": renamed_local_packs,
+        "renamed_local_packs": [],
         "level_name_changed": False,
         "manual_level_name": False,
         "config_changes": [],
     }
+    if transaction_worlds is not None:
+        transaction_worlds.append(record)
+
+    def track_world_backup(backup):
+        record["backup"] = backup
+
+    safe_copytree(src_world, dest, track_world_backup)
+    record["renamed_local_packs"] = normalize_world_local_pack_folders(dest, source_name)
 
     if yes_no(f'Set server.properties level-name to "{world_name}" so server uses this new world?', True):
-        props, config_backup = set_server_level_name(server_dir, world_name)
-        record["config_changes"].append((props, config_backup))
+        def track_config_backup(backup):
+            change = (server_dir / "server.properties", backup)
+            record["config_changes"].append(change)
+            if transaction_config_changes is not None:
+                transaction_config_changes.append(change)
+
+        set_server_level_name(server_dir, world_name, track_config_backup)
         record["level_name_changed"] = True
         ui_status("ok", f"server.properties level-name={world_name}")
     else:
@@ -1905,7 +2004,7 @@ def import_world_as_new(src_world: Path, worlds_dir: Path, default_name: str, se
     return record
 
 
-def import_world_replace(src_world: Path, existing_worlds, source_name=None):
+def import_world_replace(src_world: Path, existing_worlds, source_name=None, transaction_worlds=None):
     dest = choose_world_to_replace(existing_worlds)
     if dest is None:
         ui_status("warn", "Skipped world import.")
@@ -1917,21 +2016,28 @@ def import_world_replace(src_world: Path, existing_worlds, source_name=None):
         ui_status("warn", "Skipped world replacement.")
         return None
 
-    backup = replace_copytree(src_world, dest)
-    renamed_local_packs = normalize_world_local_pack_folders(dest, source_name)
-    return {
+    record = {
         "path": dest,
-        "backup": backup,
+        "backup": None,
         "action": "replaced",
         "source": src_world.name,
-        "renamed_local_packs": renamed_local_packs,
+        "renamed_local_packs": [],
         "level_name_changed": False,
         "manual_level_name": False,
         "config_changes": [],
     }
+    if transaction_worlds is not None:
+        transaction_worlds.append(record)
+
+    def track_world_backup(backup):
+        record["backup"] = backup
+
+    replace_copytree(src_world, dest, track_world_backup)
+    record["renamed_local_packs"] = normalize_world_local_pack_folders(dest, source_name)
+    return record
 
 
-def import_world_dir(src_world, server_dir, source_name=None):
+def import_world_dir(src_world, server_dir, source_name=None, transaction_worlds=None, transaction_config_changes=None):
     worlds_dir = server_dir / "worlds"
     if not DRY_RUN:
         worlds_dir.mkdir(parents=True, exist_ok=True)
@@ -1955,16 +2061,25 @@ def import_world_dir(src_world, server_dir, source_name=None):
             ui_status("warn", "Skipped world import.")
             return None
         if choice == "1":
-            return import_world_as_new(src_world, worlds_dir, default_name, server_dir, source_name)
+            return import_world_as_new(
+                src_world,
+                worlds_dir,
+                default_name,
+                server_dir,
+                source_name,
+                transaction_worlds,
+                transaction_config_changes,
+            )
         if choice == "2" and existing_worlds:
-            return import_world_replace(src_world, existing_worlds, source_name)
+            return import_world_replace(src_world, existing_worlds, source_name, transaction_worlds)
         valid = "0, 1, or 2" if existing_worlds else "0 or 1"
         ui_status("warn", f"Choose {valid}.")
 
 
 def is_pack_name(name: str) -> bool:
-    lower_name = name.lower()
-    return Path(lower_name).suffix in PACK_EXTS or any(lower_name.endswith(ext) for ext in TAR_EXTS)
+    """Check archive member names using ZIP's portable path separators."""
+    lower_name = normalized_zip_member_name(name).lower()
+    return PurePosixPath(lower_name).suffix in PACK_EXTS or any(lower_name.endswith(ext) for ext in TAR_EXTS)
 
 def parse_manifest_bytes(source_label: str, data: bytes):
     try:
@@ -1977,17 +2092,26 @@ def parse_manifest_bytes(source_label: str, data: bytes):
 def load_manifests_from_zip_file(z, source_label: str, depth: int, max_depth: int):
     manifests = []
     for name in z.namelist():
-        if Path(name).name == "manifest.json":
+        member_path = zip_member_path(name)
+        normalized_name = str(member_path)
+        if member_path.name == "manifest.json":
             with z.open(name) as src:
-                manifest = parse_manifest_bytes(f"{source_label}!{name}", src.read())
+                manifest = parse_manifest_bytes(f"{source_label}!{normalized_name}", src.read())
                 if manifest is not None:
-                    manifests.append((f"{source_label}!{name}", manifest))
+                    manifests.append((f"{source_label}!{normalized_name}", manifest))
             continue
-        if depth >= max_depth or not is_pack_name(name):
+        if depth >= max_depth or not is_pack_name(normalized_name):
             continue
         with z.open(name) as src:
             nested_data = src.read()
-        manifests.extend(load_manifests_from_archive_bytes(nested_data, f"{source_label}!{name}", depth + 1, max_depth))
+        manifests.extend(
+            load_manifests_from_archive_bytes(
+                nested_data,
+                f"{source_label}!{normalized_name}",
+                depth + 1,
+                max_depth,
+            )
+        )
     return manifests
 
 def load_manifests_from_tar_file(tf, source_label: str, depth: int, max_depth: int):
@@ -2054,9 +2178,7 @@ def dry_run_install_manifest(manifest_name: str, manifest: dict, server_dir: Pat
     for kind in kinds:
         base = server_dir / ("resource_packs" if kind == "rp" else "behavior_packs")
         log.info("Dry-run ensure dir: %s", base)
-        virtual_pack_dir = Path(manifest_name).parent
-        if str(virtual_pack_dir) in ("", "."):
-            virtual_pack_dir = Path(archive_stem_from_manifest(manifest_name))
+        virtual_pack_dir = _virtual_pack_dir(Path(source_name or "pack"), manifest_name)
         dest = base / pack_folder_name(virtual_pack_dir, manifest, kind, source_name)
         log.info("Dry-run would install: %s -> %s", manifest_name, dest)
         installed.append({
@@ -2141,14 +2263,10 @@ def inspect_archive(archive: Path) -> None:
 
 
 def build_archive_batch_context(archives, server_dir):
-    """Inspect selected archives so Step 4 can explain split BP/RP installs."""
+    """Inspect selected archives so Step 4 can explain and validate the batch."""
     archive_items = {}
-    selected_ids = set()
-    server_ids = {
-        pack.get("pack_id")
-        for pack in get_installed_addons(server_dir)
-        if pack.get("pack_id")
-    }
+    selected_packs = []
+    server_packs = get_installed_addons(server_dir)
     bp_count = 0
     rp_count = 0
     dependencies = []
@@ -2167,18 +2285,20 @@ def build_archive_batch_context(archives, server_dir):
             pack_id = header.get("uuid")
             kinds = detect_pack_kinds(manifest)
             if pack_id and kinds:
-                selected_ids.add(pack_id)
+                selected_packs.append({"pack_id": pack_id, "version": header.get("version")})
             if "bp" in kinds:
                 bp_count += 1
             if "rp" in kinds:
                 rp_count += 1
             dependencies.extend(manifest_dependencies(manifest))
 
+    available_versions = pack_version_index(server_packs + selected_packs)
     return {
         "archive_items": archive_items,
-        "available_ids": selected_ids | server_ids,
-        "selected_ids": selected_ids,
-        "server_ids": server_ids,
+        "available_ids": set(available_versions),
+        "available_versions": available_versions,
+        "selected_ids": {pack["pack_id"] for pack in selected_packs},
+        "server_ids": {pack.get("pack_id") for pack in server_packs if pack.get("pack_id")},
         "bp_count": bp_count,
         "rp_count": rp_count,
         "dependencies": dependencies,
@@ -2201,11 +2321,12 @@ def installed_pack_index(server_dir):
 
 
 def _virtual_pack_dir(archive: Path, manifest_name: str) -> Path:
-    label = str(manifest_name).split("!", 1)[-1]
-    parent = Path(label).parent
+    """Return a portable virtual manifest parent for preview destination naming."""
+    label = normalized_zip_member_name(str(manifest_name).split("!", 1)[-1])
+    parent = PurePosixPath(label).parent
     if str(parent) in ("", "."):
         return Path(archive.stem)
-    return parent
+    return Path(*parent.parts)
 
 
 def manifest_pack_records(archive: Path, manifest_items, server_dir: Path):
@@ -2243,7 +2364,8 @@ def scan_install_conflicts(archives, server_dir, batch_context):
     """Detect install conflicts before extraction/copy starts."""
     index = installed_pack_index(server_dir)
     conflicts = []
-    seen = {}
+    seen_keys = {}
+    seen_destinations = {}
     archive_items = batch_context.get("archive_items", {})
 
     for archive in archives:
@@ -2265,7 +2387,7 @@ def scan_install_conflicts(archives, server_dir, batch_context):
                         "installed": installed_pack,
                     })
 
-            previous = seen.get(key)
+            previous = seen_keys.get(key)
             if previous:
                 conflicts.append({
                     "type": "batch_duplicate_uuid",
@@ -2273,9 +2395,20 @@ def scan_install_conflicts(archives, server_dir, batch_context):
                     "previous": previous,
                 })
             else:
-                seen[key] = record
+                seen_keys[key] = record
 
             dest = record["dest"]
+            destination_key = os.path.normcase(str(dest.resolve()))
+            previous_destination = seen_destinations.get(destination_key)
+            if previous_destination:
+                conflicts.append({
+                    "type": "batch_duplicate_dest",
+                    "record": record,
+                    "previous": previous_destination,
+                })
+            else:
+                seen_destinations[destination_key] = record
+
             if dest.exists():
                 conflicts.append({
                     "type": "dest_exists",
@@ -2334,8 +2467,13 @@ def print_archive_batch_overview(context, archive_count) -> None:
     ]
     deps = context["dependencies"]
     if deps:
-        matched = sum(1 for dep in deps if dep["uuid"] in context["available_ids"])
-        rows.append(("Dependencies", f"{matched}/{len(deps)} manifest dependencies found"))
+        statuses = [dependency_status(dep, context["available_versions"]) for dep in deps]
+        matched = statuses.count("found")
+        mismatched = statuses.count("version_mismatch")
+        detail = f"{matched}/{len(deps)} manifest dependencies found"
+        if mismatched:
+            detail += f"; {mismatched} version mismatch"
+        rows.append(("Dependencies", detail))
     ui_panel("Selected content", rows, kind="info")
     if context["bp_count"] and context["rp_count"]:
         ui_status("ok", "BP/RP packs are present across this install batch.")
@@ -2344,7 +2482,10 @@ def print_archive_batch_overview(context, archive_count) -> None:
     elif context["rp_count"]:
         ui_status("warn", "Only Resource Packs detected in the selected archives.")
     if deps and matched != len(deps):
-        ui_status("warn", f"Manifest dependencies found: {matched}/{len(deps)}.")
+        message = f"Manifest dependencies found: {matched}/{len(deps)}."
+        if mismatched:
+            message += f" {mismatched} require a different version."
+        ui_status("warn", message)
 
 
 def pack_kind_counts(pack_items) -> tuple[int, int]:
@@ -2375,24 +2516,42 @@ def pack_content_label(bp_count: int, rp_count: int) -> str:
     return "no BP/RP packs"
 
 
-def print_pack_kind_notice(pack_items, batch_available_ids=None) -> None:
+def print_pack_kind_notice(pack_items, available_versions=None) -> None:
     """Print only extra scan notes that are not already covered by the detected row."""
-    batch_available_ids = batch_available_ids or set()
+    available_versions = available_versions or {}
     bp_count, rp_count = pack_kind_counts(pack_items)
     dependencies = [
         dep
         for _, manifest in pack_items
         for dep in manifest_dependencies(manifest)
     ]
-    matched_deps = [dep for dep in dependencies if dep["uuid"] in batch_available_ids]
+    matched_deps = [
+        dep for dep in dependencies
+        if dependency_status(dep, available_versions) == "found"
+    ]
     if bp_count and not rp_count and not matched_deps:
         ui_subitem(c_warn("Note:"), "Install companion resource pack separately if needed.")
 
+    version_mismatches = [
+        dep for dep in dependencies
+        if dependency_status(dep, available_versions) == "version_mismatch"
+    ]
+    if version_mismatches:
+        ui_subitem(c_warn("Dependency:"), f"{plural(len(version_mismatches), 'dependency')} found with a different version.")
 
-def process_archive(archive, server_dir, batch_context=None):
+
+def process_archive(
+    archive,
+    server_dir,
+    batch_context=None,
+    transaction_installed=None,
+    transaction_worlds=None,
+    transaction_config_changes=None,
+):
+    """Process one archive, registering every mutable operation with the outer rollback."""
     archive = Path(archive).expanduser().resolve()
     batch_context = batch_context or {}
-    batch_available_ids = batch_context.get("available_ids", set())
+    batch_available_versions = batch_context.get("available_versions", {})
     validate_archive(archive)
     size_mb = archive.stat().st_size / (1024 * 1024)
 
@@ -2403,7 +2562,7 @@ def process_archive(archive, server_dir, batch_context=None):
         bp_count, rp_count = pack_kind_counts(manifest_items)
         template_count = world_template_count(manifest_items)
         ui_subitem(c_gray("Detected:"), format_detected_content(bp_count, rp_count, template_count, 0))
-        print_pack_kind_notice(manifest_items, batch_available_ids)
+        print_pack_kind_notice(manifest_items, batch_available_versions)
         ui_phase("Simulate install")
         for manifest_name, manifest in manifest_items:
             try:
@@ -2434,28 +2593,47 @@ def process_archive(archive, server_dir, batch_context=None):
         bp_count, rp_count = pack_kind_counts(manifest_items)
         template_count = world_template_count(manifest_items)
         ui_subitem(c_gray("Detected:"), format_detected_content(bp_count, rp_count, template_count, len(world_dirs)))
-        print_pack_kind_notice(manifest_items, batch_available_ids)
+        print_pack_kind_notice(manifest_items, batch_available_versions)
 
         ui_phase("Install packs")
+        installable_items = []
         for manifest_path, manifest in manifest_items:
             try:
-                result = install_pack_dir(manifest_path.parent, manifest, server_dir, archive.name)
-                for pack in result:
-                    kind_label = "RP" if pack["kind"] == "rp" else "BP"
-                    folder = Path(pack["path"]).parent.name + "/" + Path(pack["path"]).name
-                    version = ".".join(map(str, pack["version"]))
-                    ui_subitem(c_ok(f"{kind_label}"), f"{pack['name']} {c_gray('v' + version)}")
-                    ui_subitem(c_gray("   ->"), folder)
-                installed.extend(result)
+                if validate_install_manifest(manifest, str(manifest_path)):
+                    installable_items.append((manifest_path, manifest))
             except Exception as e:
                 ui_status("warn", f"Skip invalid manifest: {manifest_path} ({e})")
-                log.warning("Skip invalid manifest %s: %s", manifest_path, e)
+                log.warning("Skip invalid install manifest %s: %s", manifest_path, e)
+
+        for manifest_path, manifest in installable_items:
+            # Every record is registered before copy/replace starts. Operational errors
+            # must bubble to main() so the outer transaction can roll back safely.
+            result = install_pack_dir(
+                manifest_path.parent,
+                manifest,
+                server_dir,
+                archive.name,
+                transaction_installed,
+            )
+            for pack in result:
+                kind_label = "RP" if pack["kind"] == "rp" else "BP"
+                folder = Path(pack["path"]).parent.name + "/" + Path(pack["path"]).name
+                version = ".".join(map(str, pack["version"]))
+                ui_subitem(c_ok(f"{kind_label}"), f"{pack['name']} {c_gray('v' + version)}")
+                ui_subitem(c_gray("   ->"), folder)
+            installed.extend(result)
 
         if world_dirs:
             ui_phase("World imports")
         for world_dir in world_dirs:
             if yes_no(f"Template/world detected: {world_dir.name}. Import world?", True):
-                imported = import_world_dir(world_dir, server_dir, archive.name)
+                imported = import_world_dir(
+                    world_dir,
+                    server_dir,
+                    archive.name,
+                    transaction_worlds,
+                    transaction_config_changes,
+                )
                 if imported:
                     imported_worlds.append(imported)
     finally:
@@ -2475,13 +2653,19 @@ def read_pack_list(path):
         return []
 
 
-def enable_pack(world_dir, installed):
+def enable_pack(world_dir, installed, on_prepared=None):
+    """Enable a pack and register the JSON rollback backup before writing it."""
     file_name = "world_resource_packs.json" if installed["kind"] == "rp" else "world_behavior_packs.json"
     path = world_dir / file_name
     packs = read_pack_list(path)
     packs = [p for p in packs if p.get("pack_id") != installed["pack_id"]]
     packs.append({"pack_id": installed["pack_id"], "version": installed["version"]})
-    backup = write_text(path, json.dumps(packs, indent=2) + "\n")
+
+    def track_backup(backup):
+        if on_prepared:
+            on_prepared(path, backup)
+
+    backup = write_text(path, json.dumps(packs, indent=2) + "\n", track_backup)
     return path, backup
 
 
@@ -2498,7 +2682,7 @@ def check_texturepack_required(server_dir):
     return False
 
 
-def set_texturepack_required(server_dir):
+def set_texturepack_required(server_dir, on_prepared=None):
     props = server_dir / "server.properties"
     content = props.read_text(encoding="utf-8", errors="ignore")
     lines = content.splitlines()
@@ -2513,7 +2697,7 @@ def set_texturepack_required(server_dir):
     if not found:
         new_lines.append("texturepack-required=true")
     # Use consistent newlines (\n) for cross-platform compatibility
-    return write_text(props, "\n".join(new_lines) + "\n")
+    return write_text(props, "\n".join(new_lines) + "\n", on_prepared)
 
 
 def imported_world_path(world):
@@ -2678,15 +2862,18 @@ def print_summary(archive_results, dep_missing) -> None:
 
         # Missing Deps per addon
         pack_ids = {p["pack_id"] for p in packs}
-        local_missing = [(p, d) for p, d in dep_missing if p["pack_id"] in pack_ids]
-        if local_missing:
-            ui_status("err", f"Action needed: {plural(len(local_missing), 'missing manifest dependency', 'missing manifest dependencies')}.")
+        local_issues = [(p, d, status) for p, d, status in dep_missing if p["pack_id"] in pack_ids]
+        if local_issues:
+            ui_status("err", f"Action needed: {plural(len(local_issues), 'manifest dependency issue', 'manifest dependency issues')}.")
             ui_kv("  Note", "Dependency type is unknown; it may be BP, RP, or another pack.")
-            for pack, dep in local_missing:
+            for pack, dep, status in local_issues:
                 ui_kv("  Pack", c_err(pack["name"]))
-                ui_kv("  Needs", f"{c_yellow(dep['uuid'])} version {dep.get('version')} (type unknown)")
+                if status == "version_mismatch":
+                    ui_kv("  Needs", f"{c_yellow(dep['uuid'])} version {dep.get('version')} (installed version differs)")
+                else:
+                    ui_kv("  Needs", f"{c_yellow(dep['uuid'])} version {dep.get('version')} (missing)")
         else:
-            ui_status("ok", "No missing dependencies.")
+            ui_status("ok", "No missing or mismatched dependencies.")
 
 
 # Built-in Minecraft folder prefixes/patterns that must not be deleted
@@ -3502,11 +3689,18 @@ def main():
             size_str = f"{archive.stat().st_size / (1024*1024):.1f} MB"
             print(c_divider(f"Archive {idx}/{total_archives}: {archive.name}"))
             ui_kv("Size", size_str)
-            packs, worlds = process_archive(archive, server_dir, batch_context)
-            installed.extend(packs)
-            imported_worlds.extend(worlds)
-            for world in worlds:
-                config_changes.extend(world.get("config_changes", []))
+            packs, worlds = process_archive(
+                archive,
+                server_dir,
+                batch_context,
+                installed,
+                imported_worlds,
+                config_changes,
+            )
+            # Dry-run never mutates, so no transaction records are registered there.
+            if DRY_RUN:
+                installed.extend(packs)
+                imported_worlds.extend(worlds)
             archive_results.append((archive.name, packs, worlds))
 
         if not installed:
@@ -3523,16 +3717,21 @@ def main():
         for pack in installed:
             kind_label = "RP" if pack["kind"] == "rp" else "BP"
             json_file = "world_resource_packs.json" if pack["kind"] == "rp" else "world_behavior_packs.json"
-            path, backup = enable_pack(world_dir, pack)
-            config_changes.append((path, backup))
+
+            def track_config_change(path, backup):
+                config_changes.append((path, backup))
+
+            enable_pack(world_dir, pack, track_config_change)
             pack_name = pack["name"]
             ui_status("ok", f"[{kind_label}] {pack_name} -> {json_file}")
 
         if any(pack["kind"] == "rp" for pack in installed):
             if not check_texturepack_required(server_dir):
                 if yes_no("\nSet texturepack-required=true so clients automatically download the pack?", True):
-                    backup = set_texturepack_required(server_dir)
-                    config_changes.append((server_dir / "server.properties", backup))
+                    def track_texturepack_change(backup):
+                        config_changes.append((server_dir / "server.properties", backup))
+
+                    set_texturepack_required(server_dir, track_texturepack_change)
                     ui_status("ok", "texturepack-required=true")
 
         # Step 7: Summary

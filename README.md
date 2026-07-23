@@ -146,7 +146,9 @@ Before copying packs, the installer pre-scans selected archives and reports poss
 - same pack UUID already installed
 - selected version differs from installed version
 - same pack UUID selected more than once in the batch
+- two selected packs planning the same destination folder
 - destination pack folder already exists
+- required dependency UUID/version mismatch
 
 If conflicts are found, choose:
 
@@ -263,7 +265,7 @@ Text fallback mode supports:
 
 ## Files modified by install
 
-Before these writes, the conflict scanner warns about duplicate UUIDs, version changes, duplicate selected packs, and existing destination folders.
+Before these writes, the conflict scanner warns about duplicate UUIDs, version changes, duplicate selected packs, duplicate planned destination folders, existing destination folders, and dependency version mismatches.
 
 The script may create or modify:
 
@@ -380,8 +382,10 @@ The installer protects against archive path traversal.
 
 For ZIP files:
 
-- every member path is normalized
+- `/` and Windows-style `\` member separators are normalized consistently for inspect, dry-run, and extraction
 - extraction target must stay inside the temp folder
+
+For localized pack names, `texts/languages.json` entries are accepted only as plain language identifiers. Path-like entries are ignored so a pack cannot make the installer read `.lang` files outside its own `texts/` folder.
 
 For TAR files:
 
@@ -427,7 +431,7 @@ After extraction, the script scans for:
 Pack type is detected from manifest modules:
 
 - module type `resources` means Resource Pack
-- module type `data` means Behavior Pack
+- module type `data` or `script` means Behavior Pack
 
 One manifest can produce more than one install target if it contains multiple supported module types.
 
